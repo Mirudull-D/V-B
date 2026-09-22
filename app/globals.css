@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+:root {
+  --primary: #3F3F46;
+  --secondary: #3F3F46;
+  --tertiary: #71717A;
+}
+
+body {
+  font-family: var(--font-poppins), system-ui, -apple-system, "Segoe UI", sans-serif;
+  background-color: #FFFFFF;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3F3F46;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525B;
+}
+
+@layer utilities {
+  .minimal-input {
+    @apply w-full bg-transparent border-b border-black/10 py-2 text-[#000000] focus:outline-none focus:border-[#3F3F46] transition-colors placeholder:text-[#000000];
+  }
+}
+
+/* Hide number input spin buttons */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
+@theme {
+  --color-primary: #3F3F46;
+  --color-secondary: #3F3F46;
+  --color-tertiary: #71717A;
+  --animate-float: float 3s ease-in-out infinite;
+  --animate-swing: swing 2.5s ease-in-out infinite;
+  --animate-pop: pop 2s ease-in-out infinite;
+  --animate-pulse-slow: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+  }
+  @keyframes swing {
+    0%, 100% { transform: rotate(-5deg); }
+    50% { transform: rotate(5deg); }
+  }
+  @keyframes pop {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.1); }
+  }
+}

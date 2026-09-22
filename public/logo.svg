@@ -1,0 +1,16 @@
+<svg viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="RAJA MOBILES">
+  <g fill="#18181B">
+    <!-- Crown spikes -->
+    <path d="M56 104 L64 48 L84 80 L102 56 L111 69 L120 40 L129 69 L138 56 L156 80 L176 48 L184 104 Z" />
+    <!-- Crown band -->
+    <rect x="54" y="102" width="132" height="18" rx="6" />
+    <!-- Band highlight (echoes the ring gap in the mark) -->
+    <rect x="60" y="108" width="120" height="3.5" rx="1.75" fill="#FFFFFF" />
+  </g>
+  <!-- Stylised R (rounded brush strokes) -->
+  <g fill="none" stroke="#18181B" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M96 124 L96 208" />
+    <path d="M96 124 C 152 118 152 172 96 168" />
+    <path d="M108 162 L150 208" />
+  </g>
+</svg>
