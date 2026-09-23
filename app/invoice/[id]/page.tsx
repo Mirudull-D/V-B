@@ -111,7 +111,7 @@ export default async function InvoicePage({
           The requested invoice identifier #{id} could not be found.
         </p>
         <Link
-          href="/pos/admin/secure/control-panel/raja-mobiles"
+          href="/pos/admin/secure/control-panel/vijaya-lakshmi"
           className="inline-flex items-center gap-2 px-4 py-2 bg-zinc-900 hover:bg-zinc-800 rounded-md text-white font-medium text-xs transition-colors"
         >
           <ArrowLeft className="w-3.5 h-3.5" /> Back to Dashboard
@@ -198,7 +198,7 @@ export default async function InvoicePage({
         {/* Header: Company & Invoice Info */}
         <div className="flex flex-col sm:flex-row justify-between items-start gap-6 pb-6 border-b border-zinc-200">
           <div className="flex items-start gap-3.5 sm:gap-4">
-            <div className="w-14 h-14 sm:w-16 sm:h-16 shrink-0 rounded-sm border border-zinc-200 overflow-hidden bg-white p-1">
+            <div className="w-14 h-14 sm:w-16 sm:h-16 shrink-0 rounded-sm border border-[#14243D] overflow-hidden bg-[#14243D] p-1">
               <img
                 src="/logo.jpeg"
                 alt="VIJAYA LAKSHMI INDUSTRIES"

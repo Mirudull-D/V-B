@@ -55,7 +55,7 @@ export function InvoiceActions({
     <div className="w-full flex flex-wrap items-center justify-between gap-3 bg-white border border-zinc-200/80 rounded-sm p-3 shadow-xs print:hidden">
       {/* Return to POS */}
       <Link
-        href="/pos/admin/secure/control-panel/raja-mobiles"
+        href="/pos/admin/secure/control-panel/vijaya-lakshmi"
         className="inline-flex items-center gap-1.5 text-xs font-medium text-zinc-700 hover:text-zinc-950 px-3 py-1.5 rounded-sm bg-zinc-50 hover:bg-zinc-100 border border-zinc-200 transition-colors cursor-pointer"
       >
         <ArrowLeft className="w-3.5 h-3.5" />

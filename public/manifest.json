@@ -2,10 +2,10 @@
   "name": "VIJAYA LAKSHMI INDUSTRIES - POS",
   "short_name": "VIJAYA LAKSHMI",
   "description": "VIJAYA LAKSHMI INDUSTRIES Point of Sale, Billing & Inventory Management",
-  "start_url": "/pos/admin/secure/control-panel/raja-mobiles",
+  "start_url": "/pos/admin/secure/control-panel/vijaya-lakshmi",
   "display": "standalone",
   "background_color": "#FFFFFF",
-  "theme_color": "#3F3F46",
+  "theme_color": "#14243D",
   "orientation": "any",
   "scope": "/",
   "icons": [

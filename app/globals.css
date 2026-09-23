@@ -1,9 +1,9 @@
 @import "tailwindcss";
 
 :root {
-  --primary: #3F3F46;
-  --secondary: #3F3F46;
-  --tertiary: #71717A;
+  --primary: #14243D;
+  --secondary: #14243D;
+  --tertiary: #4A5878;
 }
 
 body {
@@ -20,16 +20,16 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3F3F46;
+  background: #14243D;
   border-radius: 10px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #52525B;
+  background: #9A7A24;
 }
 
 @layer utilities {
   .minimal-input {
-    @apply w-full bg-transparent border-b border-black/10 py-2 text-[#000000] focus:outline-none focus:border-[#3F3F46] transition-colors placeholder:text-[#000000];
+    @apply w-full bg-transparent border-b border-black/10 py-2 text-[#000000] focus:outline-none focus:border-[#14243D] transition-colors placeholder:text-[#000000];
   }
 }
 
@@ -44,9 +44,9 @@ input[type="number"] {
 }
 
 @theme {
-  --color-primary: #3F3F46;
-  --color-secondary: #3F3F46;
-  --color-tertiary: #71717A;
+  --color-primary: #14243D;
+  --color-secondary: #14243D;
+  --color-tertiary: #4A5878;
   --animate-float: float 3s ease-in-out infinite;
   --animate-swing: swing 2.5s ease-in-out infinite;
   --animate-pop: pop 2s ease-in-out infinite;

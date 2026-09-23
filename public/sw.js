@@ -4,7 +4,7 @@ const ASSETS_TO_CACHE = [
   '/manifest.json',
   '/logo.png',
   '/icon.png',
-  '/pos/admin/secure/control-panel/raja-mobiles'
+  '/pos/admin/secure/control-panel/vijaya-lakshmi'
 ];
 
 self.addEventListener('install', (event) => {
