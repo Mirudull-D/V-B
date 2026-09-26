@@ -96,7 +96,7 @@ const EXPENSE_PAYMENT_MODES = ["CASH", "UPI", "CARD", "BANK", "OTHER"] as const;
 
 // Payment / financing options available at the point of sale.
 // Kept in sync with the CHECK constraint on orders.payment_mode in schema.sql.
-const ORDER_PAYMENT_MODES = ["CASH", "TVS", "BAJAJ", "HDP", "DMI"] as const;
+const ORDER_PAYMENT_MODES = ["CASH", "GPAY"] as const;
 type OrderPaymentMode = (typeof ORDER_PAYMENT_MODES)[number];
 
 // Shared date-window test reused by the Expenses tab and the analytics dashboard.
@@ -2778,7 +2778,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., Pure Camphor Tablets 100g"
+                  placeholder="e.g., Designer Silk Saree, Embroidered Blouse"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-bold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatName}
                   onChange={(e) => setNewCatName(e.target.value)}
@@ -2792,7 +2792,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., 100g, pooja grade, family pack"
+                  placeholder="e.g., Kanchipuram Silk, Size 38, Pure Georgette"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatDesc}
                   onChange={(e) => setNewCatDesc(e.target.value)}
@@ -2806,7 +2806,7 @@ export default function POSBilling() {
                 <input
                   type="text"
                   list="catalog-category-list"
-                  placeholder="e.g., Camphor, Puja Items, Incense"
+                  placeholder="e.g., Blouses, Sarees, Fabrics, Lehengas"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatCategory}
                   onChange={(e) => setNewCatCategory(e.target.value)}
@@ -2929,7 +2929,7 @@ export default function POSBilling() {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g., 3307"
+                    placeholder="e.g., 6117 or 6204"
                     className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                     value={newCatHsn}
                     onChange={(e) => setNewCatHsn(e.target.value)}
@@ -2943,7 +2943,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., Mangalam Chemicals, Cycle Pure"
+                  placeholder="e.g., Sree Boutique, Handloom Weaves, Chennai Silks"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatManufacturer}
                   onChange={(e) => setNewCatManufacturer(e.target.value)}
@@ -2961,7 +2961,7 @@ export default function POSBilling() {
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g., Sri Traders"
+                      placeholder="e.g., Surat Textile Mills, Kanchipuram Weavers"
                       className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                       value={newCatSupplierName}
                       onChange={(e) => setNewCatSupplierName(e.target.value)}
@@ -3140,7 +3140,7 @@ export default function POSBilling() {
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g., Sri Traders"
+                      placeholder="e.g., Surat Textile Mills, Kanchipuram Weavers"
                       className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                       value={newCatSupplierName}
                       onChange={(e) => setNewCatSupplierName(e.target.value)}
@@ -4223,24 +4223,24 @@ export default function POSBilling() {
                         </div>
                       </div>
 
-                      {/* Financial Option — payment method / EMI provider */}
+                      {/* Financial Option — payment method */}
                       <div className="pt-2 space-y-1.5">
                         <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider">
                           Financial Option
                         </span>
-                        <div className="grid grid-cols-5 gap-1.5">
+                        <div className="grid grid-cols-2 gap-2">
                           {ORDER_PAYMENT_MODES.map((mode) => (
                             <button
                               key={mode}
                               type="button"
                               onClick={() => setPaymentMode(mode)}
-                              className={`py-1.5 rounded-lg text-[10px] font-bold tracking-wider uppercase transition-all cursor-pointer border ${
+                              className={`py-2 rounded-lg text-xs font-bold tracking-wider uppercase transition-all cursor-pointer border ${
                                 paymentMode === mode
                                   ? "bg-[#14243D] text-white border-[#14243D] shadow-sm"
                                   : "bg-white text-[#000000] border-black/10 hover:border-[#14243D]"
                               }`}
                             >
-                              {mode}
+                              {mode === "GPAY" ? "GPay" : mode}
                             </button>
                           ))}
                         </div>
@@ -4262,7 +4262,7 @@ export default function POSBilling() {
                       {/* Cash / Finance Amount Received */}
                       <div className="bg-[#FFFFFF]/40 border border-black/10 rounded-xl p-4 mt-2">
                         <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-0.5">
-                          {paymentMode === "CASH" ? "Cash Payment" : `${paymentMode} Finance`}
+                          {paymentMode === "CASH" ? "Cash Payment" : "GPay Payment"}
                         </span>
                         <label className="block text-[10px] font-bold text-[#000000] mb-2.5">
                           Amount Received (₹)
@@ -4411,16 +4411,16 @@ export default function POSBilling() {
 
                 <div>
                   <label className="block text-[10px] font-bold text-[#000000] uppercase tracking-wider mb-1.5">Deposit Payment Mode</label>
-                  <div className="grid grid-cols-5 gap-1.5">
+                  <div className="grid grid-cols-2 gap-2">
                     {ORDER_PAYMENT_MODES.map((mode) => (
                       <button
                         key={mode}
                         onClick={() => setAdvDepositPaymentMode(mode)}
-                        className={`py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-all cursor-pointer ${
+                        className={`py-2 rounded-lg text-xs font-bold uppercase tracking-wider border transition-all cursor-pointer ${
                           advDepositPaymentMode === mode ? "bg-[#14243D] text-white border-[#14243D]" : "bg-white text-black border-black/10 hover:border-[#14243D]"
                         }`}
                       >
-                        {mode}
+                        {mode === "GPAY" ? "GPay" : mode}
                       </button>
                     ))}
                   </div>
@@ -4550,16 +4550,16 @@ export default function POSBilling() {
 
                     <div>
                       <label className="block text-[10px] font-bold text-[#000000] uppercase tracking-wider mb-1.5">Payment Method</label>
-                      <div className="grid grid-cols-5 gap-1.5">
+                      <div className="grid grid-cols-2 gap-2">
                         {ORDER_PAYMENT_MODES.map((mode) => (
                           <button
                             key={mode}
                             onClick={() => setReceivePaymentMode(mode)}
-                            className={`py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition-all cursor-pointer ${
+                            className={`py-2 rounded-lg text-xs font-bold uppercase tracking-wider border transition-all cursor-pointer ${
                               receivePaymentMode === mode ? "bg-[#14243D] text-white border-[#14243D]" : "bg-white text-black border-black/10 hover:border-[#14243D]"
                             }`}
                           >
-                            {mode}
+                            {mode === "GPAY" ? "GPay" : mode}
                           </button>
                         ))}
                       </div>

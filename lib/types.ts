@@ -62,7 +62,7 @@ export type Customer = {
   created_at: string;
 };
 
-export type PaymentMode = 'CASH' | 'TVS' | 'BAJAJ' | 'HDP' | 'DMI';
+export type PaymentMode = 'CASH' | 'GPAY';
 
 export type OrderRow = {
   id: string;
