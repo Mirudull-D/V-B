@@ -36,7 +36,6 @@ import {
   Pencil,
   Boxes,
   AlertTriangle,
-  Smartphone,
   Check,
   PackageX,
   Wallet,
@@ -2779,7 +2778,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., Redmi Note 13 (128GB)"
+                  placeholder="e.g., Pure Camphor Tablets 100g"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-bold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatName}
                   onChange={(e) => setNewCatName(e.target.value)}
@@ -2793,7 +2792,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., 128GB, Ice Blue, 6GB RAM"
+                  placeholder="e.g., 100g, pooja grade, family pack"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatDesc}
                   onChange={(e) => setNewCatDesc(e.target.value)}
@@ -2930,7 +2929,7 @@ export default function POSBilling() {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g., 8517"
+                    placeholder="e.g., 3307"
                     className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                     value={newCatHsn}
                     onChange={(e) => setNewCatHsn(e.target.value)}
@@ -2944,7 +2943,7 @@ export default function POSBilling() {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g., Samsung, Xiaomi, boAt"
+                  placeholder="e.g., Mangalam Chemicals, Cycle Pure"
                   className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
                   value={newCatManufacturer}
                   onChange={(e) => setNewCatManufacturer(e.target.value)}

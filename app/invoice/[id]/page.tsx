@@ -321,7 +321,7 @@ export default async function InvoicePage({
                     </td>
                     {order.is_gst && (
                       <td className="py-3 text-center font-mono text-zinc-500">
-                        8517
+                        {item.hsn_code || "-"}
                       </td>
                     )}
                     <td className="py-3 text-center text-zinc-800 font-medium">
@@ -383,7 +383,7 @@ export default async function InvoicePage({
             <div className="text-[11px] text-zinc-500 leading-relaxed pt-2">
               <p className="font-medium text-zinc-700 mb-0.5">Terms & Notes:</p>
               <p>• Goods once sold can only be exchanged within 7 days with this invoice.</p>
-              <p>• Brand manufacturer warranty applies to phones and accessories.</p>
+              <p>• Manufacturer warranty applies to eligible products where available.</p>
             </div>
           </div>
 

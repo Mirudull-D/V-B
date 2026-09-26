@@ -246,8 +246,10 @@ export const dbStore = {
 
     const orderIds = orders.map((o: any) => o.id);
     const items = await sql`
-      SELECT * FROM order_items
-      WHERE order_id = ANY(${orderIds})
+      SELECT oi.*, b.hsn_code
+      FROM order_items oi
+      LEFT JOIN product_batches b ON b.id = oi.batch_id
+      WHERE oi.order_id = ANY(${orderIds})
     `;
 
     return orders.map((o: any) => ({
@@ -265,7 +267,12 @@ export const dbStore = {
     `;
     if (orders.length === 0) return null;
 
-    const items = await sql`SELECT * FROM order_items WHERE order_id = ${id}`;
+    const items = await sql`
+      SELECT oi.*, b.hsn_code
+      FROM order_items oi
+      LEFT JOIN product_batches b ON b.id = oi.batch_id
+      WHERE oi.order_id = ${id}
+    `;
 
     return {
       ...(orders[0] as any),

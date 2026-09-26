@@ -79,7 +79,7 @@ DATABASE_URL=postgresql://user:password@hostname/dbname?sslmode=require
 
 ### 3. Set up the database
 
-Run `schema.sql` once in your Neon SQL Editor (or `psql`) to create a clean, empty database. Optionally run `seed.sql` afterwards to load some sample mobile-shop data.
+Run `schema.sql` once in your Neon SQL Editor (or `psql`) to create a clean, empty database. Optionally run `seed.sql` afterwards to load some sample data.
 
 ### 4. Run the Development Server
 
@@ -90,7 +90,7 @@ npm run dev
 Open http://localhost:3000.
 
 - Public store page: `/`
-- POS terminal: `/pos/admin/secure/control-panel/raja-mobiles`
+- POS terminal: `/pos/admin/secure/control-panel/vijaya-lakshmi`
 - Digital invoice: `/invoice/[invoice-id]`
 
 ## Data Model

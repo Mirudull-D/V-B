@@ -92,6 +92,7 @@ export type OrderItemRow = {
   snapshot_name: string;
   snapshot_price: number;
   quantity: number;
+  hsn_code?: string | null; // joined from product_batches at read time (not stored on order_items)
 };
 
 export type OrderWithRelations = OrderRow & {

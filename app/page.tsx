@@ -1,4 +1,4 @@
-import { MapPin, Clock, Phone, Store, Smartphone, Mail } from "lucide-react";
+import { MapPin, Clock, Phone, Store, Package, Mail } from "lucide-react";
 
 export default function Home() {
   return (
@@ -38,7 +38,7 @@ export default function Home() {
 
           <div className="space-y-6 text-left max-w-md mx-auto text-sm font-semibold text-[#1A1A1A]/80 border-t border-black/10 pt-8">
             <div className="flex items-start gap-4">
-              <Smartphone className="w-5 h-5 text-[#14243D] shrink-0 mt-0.5" />
+              <Package className="w-5 h-5 text-[#14243D] shrink-0 mt-0.5" />
               <div>
                 <p className="text-[10px] font-bold text-black/50 uppercase tracking-wider mb-0.5">What We Offer</p>
                 <p className="text-[#1A1A1A] leading-relaxed">
