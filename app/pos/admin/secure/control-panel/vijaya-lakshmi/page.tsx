@@ -50,11 +50,13 @@ import {
   Loader2,
   Clock,
   MessageSquare,
+  MessageCircle,
 } from "lucide-react";
 import {
   verifyPasscode,
   fetchProducts,
   fetchOrders,
+  fetchOrderById,
   submitOrder,
   removeOrder,
   createProduct,
@@ -68,6 +70,8 @@ import {
   removeExpense,
   fetchCategories,
   createCategory,
+  renameCategory,
+  removeCategory,
   fetchStockMovements,
   fetchAdvanceOrders,
   createAdvanceOrder,
@@ -76,7 +80,7 @@ import {
   finalizeAdvanceOrder,
   setAdvanceOrderStatus,
 } from "@/app/pos/actions";
-import { ProductWithBatches, ProductBatch, CartItem, Expense, Category, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
+import { ProductWithBatches, ProductBatch, CartItem, Expense, Category, AdvanceOrderWithRelations, AdvanceOrderStatus, StockMovement } from "@/lib/types";
 
 // Preset expense categories (users can also type a custom one)
 const EXPENSE_CATEGORIES = [
@@ -94,10 +98,12 @@ const EXPENSE_CATEGORIES = [
 
 const EXPENSE_PAYMENT_MODES = ["CASH", "UPI", "CARD", "BANK", "OTHER"] as const;
 
-// Payment / financing options available at the point of sale.
-// Kept in sync with the CHECK constraint on orders.payment_mode in schema.sql.
+// Payment options available at the point of sale.
+// ORDER_PAYMENT_MODES is used for single-mode contexts (advance deposit / balance).
+// POS_PAYMENT_MODES adds Split for full sales at the billing counter.
 const ORDER_PAYMENT_MODES = ["CASH", "GPAY"] as const;
-type OrderPaymentMode = (typeof ORDER_PAYMENT_MODES)[number];
+const POS_PAYMENT_MODES = ["CASH", "GPAY", "SPLIT"] as const;
+type OrderPaymentMode = "CASH" | "GPAY" | "SPLIT";
 
 // Shared date-window test reused by the Expenses tab and the analytics dashboard.
 type PeriodKey = "all" | "today" | "week" | "month" | "year" | "custom";
@@ -187,6 +193,8 @@ type CompletedOrder = {
   deliveryFee: number;
   grandTotal: number;
   cashReceived: number;
+  splitCash?: number;
+  splitGpay?: number;
   paymentMode: OrderPaymentMode;
   date: string;
   createdAt: string;
@@ -402,6 +410,8 @@ export default function POSBilling() {
   const [isCheckingAuth, setIsCheckingAuth] = useState<boolean>(true);
 
   const [activeCategory, setActiveCategory] = useState<string>("ALL");
+  const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
+  const [inventoryView, setInventoryView] = useState<"products" | "stockReport">("products");
   const [activeTab, setActiveTab] = useState<
     "billing" | "orders" | "analytics" | "inventory" | "alerts" | "expenses" | "advance"
   >("billing");
@@ -437,6 +447,15 @@ export default function POSBilling() {
 
   const [advSearchQuery, setAdvSearchQuery] = useState("");
   const [advStatusFilter, setAdvStatusFilter] = useState<"ALL" | AdvanceOrderStatus>("ALL");
+  const [advPeriod, setAdvPeriod] = useState<
+    "all" | "today" | "week" | "month" | "year" | "custom"
+  >("all");
+  const [advStartDate, setAdvStartDate] = useState<string>(
+    new Date().toISOString().split("T")[0],
+  );
+  const [advEndDate, setAdvEndDate] = useState<string>(
+    new Date().toISOString().split("T")[0],
+  );
   const [discountValue, setDiscountValue] = useState<number>(0);
   const [discountType, setDiscountType] = useState<"fixed" | "percent">(
     "fixed",
@@ -444,9 +463,46 @@ export default function POSBilling() {
   const [deliveryFee, setDeliveryFee] = useState<number>(0);
   const [cashReceived, setCashReceived] = useState<number>(0);
   const [paymentMode, setPaymentMode] = useState<OrderPaymentMode>("CASH");
+  // Split payment: cash + gpay portions (only used when paymentMode === "SPLIT")
+  const [splitCash, setSplitCash] = useState<number>(0);
+  const [splitGpay, setSplitGpay] = useState<number>(0);
   const [applyGST, setApplyGST] = useState<boolean>(false);
   const [gstPercentage, setGstPercentage] = useState<number>(18);
-  const [activeInvoiceId, setActiveInvoiceId] = useState<string | null>(null);
+  
+  const [printSettingsModal, setPrintSettingsModal] = useState<{
+    id: string;
+    type: "invoice" | "advance";
+  } | null>(null);
+
+  const [printPrefs, setPrintPrefs] = useState<{
+    paper: "thermal" | "a4";
+    size: "58" | "80" | "a4" | "a5";
+  }>({ paper: "thermal", size: "80" });
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("shalistone_print_prefs");
+      if (stored) {
+        setPrintPrefs(JSON.parse(stored));
+      }
+    } catch (err) {}
+  }, []);
+
+  const handleOpenPrintModal = (id: string, type: "invoice" | "advance") => {
+    setPrintSettingsModal({ id, type });
+  };
+
+  const executePrint = () => {
+    if (!printSettingsModal) return;
+    try {
+      localStorage.setItem("shalistone_print_prefs", JSON.stringify(printPrefs));
+    } catch (err) {}
+    
+    const baseUrl = printSettingsModal.type === "invoice" ? `/invoice/${printSettingsModal.id}` : `/advance/${printSettingsModal.id}`;
+    const url = `${baseUrl}?print=true&paper=${printPrefs.paper}&size=${printPrefs.size}`;
+    window.open(url, "_blank");
+    setPrintSettingsModal(null);
+  };
   const [completedBillData, setCompletedBillData] =
     useState<CompletedOrder | null>(null);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState<boolean>(false);
@@ -454,6 +510,24 @@ export default function POSBilling() {
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Category management (create / rename / delete)
+  const [showCategoryModal, setShowCategoryModal] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
+  const [editCategoryName, setEditCategoryName] = useState("");
+  const [isSavingCategory, setIsSavingCategory] = useState(false);
+
+  // Advance-order receipt modal (shown after creating an advance order)
+  const [advanceReceipt, setAdvanceReceipt] = useState<{
+    id: string;
+    customerName: string;
+    customerPhone: string;
+    total: number;
+    deposit: number;
+    balance: number;
+    items: { name: string; qty: number; price: number }[];
+  } | null>(null);
 
   // Modal States
   const [showLowStockAlertModal, setShowLowStockAlertModal] = useState<boolean>(false);
@@ -614,12 +688,13 @@ export default function POSBilling() {
   const fetchData = async () => {
     setIsRefreshing(true);
     try {
-      const [productsData, ordersData, expensesData, categoriesData, advanceData] = await Promise.all([
+      const [productsData, ordersData, expensesData, categoriesData, advanceData, stockMovementsData] = await Promise.all([
         fetchProducts(),
         fetchOrders(),
         fetchExpenses(),
         fetchCategories(),
         fetchAdvanceOrders(),
+        fetchStockMovements(),
       ]);
       setAdvanceOrders(
         advanceData.map((a) => ({
@@ -636,6 +711,7 @@ export default function POSBilling() {
       );
       setCatalog(productsData.map(productToCatalogItem));
       setCategories(categoriesData);
+      setStockMovements(stockMovementsData);
       setExpenses(
         expensesData.map((e) => ({ ...e, amount: Number(e.amount) || 0 })),
       );
@@ -1196,6 +1272,16 @@ export default function POSBilling() {
         })),
       });
 
+      setAdvanceReceipt({
+        id: advId,
+        customerName: customerName || "Guest",
+        customerPhone,
+        total: grandTotal,
+        deposit,
+        balance: grandTotal - deposit,
+        items: items.map((i) => ({ name: i.name, qty: i.qty, price: i.price })),
+      });
+
       // Reset billing form.
       setItems([{ id: "1", name: "", desc: "", price: 0, qty: 1 }]);
       setCustomerName("");
@@ -1206,8 +1292,6 @@ export default function POSBilling() {
       setCashReceived(0);
       setShowAdvanceSaveModal(false);
       await fetchData();
-      alert(`Advance order ${advId} saved. Deposit ₹${deposit.toLocaleString(undefined, { minimumFractionDigits: 2 })} recorded.`);
-      setActiveTab("advance");
     } catch (err) {
       console.error("Failed to save advance order:", err);
       alert("Could not save the advance order. Please try again.");
@@ -1362,6 +1446,21 @@ export default function POSBilling() {
         : 0;
     const localGrandTotal = localNetInclusive + deliveryFee;
 
+    if (paymentMode === "SPLIT") {
+      const splitTotal = splitCash + splitGpay;
+      if (splitTotal < localGrandTotal) {
+        alert(
+          `Split payment total (₹${splitTotal.toFixed(2)}) cannot be less than the grand total (₹${localGrandTotal.toFixed(2)}).`,
+        );
+        return null;
+      }
+    } else if (cashReceived < localGrandTotal) {
+      alert(
+        `Amount received (₹${cashReceived.toFixed(2)}) cannot be less than the grand total (₹${localGrandTotal.toFixed(2)}).`,
+      );
+      return null;
+    }
+
     // Validate totals against PostgreSQL numeric(10,2) overflow limit (99,999,999.99)
     const MAX_LIMIT = 99999999.99;
     if (
@@ -1423,7 +1522,9 @@ export default function POSBilling() {
         gstAmount: localGstAmount,
         deliveryFee: deliveryFee,
         grandTotal: localGrandTotal,
-        cashReceived: cashReceived,
+        cashReceived: paymentMode === "SPLIT" ? splitCash + splitGpay : cashReceived,
+        splitCash: paymentMode === "SPLIT" ? splitCash : undefined,
+        splitGpay: paymentMode === "SPLIT" ? splitGpay : undefined,
         paymentMode: paymentMode,
       });
 
@@ -1450,7 +1551,9 @@ export default function POSBilling() {
         gstAmount: Number(localGstAmount) || 0,
         deliveryFee: Number(deliveryFee) || 0,
         grandTotal: Number(localGrandTotal) || 0,
-        cashReceived: Number(cashReceived) || 0,
+        cashReceived: paymentMode === "SPLIT" ? Number(splitCash) + Number(splitGpay) : (Number(cashReceived) || 0),
+        splitCash: paymentMode === "SPLIT" ? Number(splitCash) : undefined,
+        splitGpay: paymentMode === "SPLIT" ? Number(splitGpay) : undefined,
         paymentMode: paymentMode,
         date: orderTimestamp,
         createdAt: new Date().toISOString(),
@@ -1493,6 +1596,8 @@ export default function POSBilling() {
       setDeliveryFee(0);
       setCashReceived(0);
       setPaymentMode("CASH");
+      setSplitCash(0);
+      setSplitGpay(0);
       setApplyGST(false);
       setGstPercentage(18);
 
@@ -1598,10 +1703,95 @@ export default function POSBilling() {
     setOrders((prev) => prev.filter((o) => o.id !== orderId));
     if (selectedOrder?.id === orderId) setSelectedOrder(null);
     if (completedBillData?.id === orderId) setCompletedBillData(null);
-    if (activeInvoiceId === orderId) setActiveInvoiceId(null);
+    if (printSettingsModal?.id === orderId) setPrintSettingsModal(null);
   };
 
+  // ── Category Management ──────────────────────────────────────────────
+  const refreshCategories = async () => {
+    try {
+      const cats = await fetchCategories();
+      setCategories(cats);
+    } catch (error) {
+      console.error("Failed to refresh categories:", error);
+    }
+  };
+
+  const handleAddCategory = async () => {
+    if (!newCategoryName.trim()) {
+      alert("Category name cannot be empty.");
+      return;
+    }
+    setIsSavingCategory(true);
+    try {
+      await createCategory(newCategoryName);
+      setNewCategoryName("");
+      await refreshCategories();
+    } catch (err) {
+      alert("Failed to create category. It might already exist.");
+    } finally {
+      setIsSavingCategory(false);
+    }
+  };
+
+  const handleSaveEditCategory = async () => {
+    if (!editingCategoryId || !editCategoryName.trim()) return;
+    setIsSavingCategory(true);
+    try {
+      await renameCategory(editingCategoryId, editCategoryName);
+      setEditingCategoryId(null);
+      setEditCategoryName("");
+      await refreshCategories();
+    } catch (err) {
+      alert("Failed to update category.");
+    } finally {
+      setIsSavingCategory(false);
+    }
+  };
+
+  const handleDeleteCategory = async (id: string) => {
+    if (!window.confirm("Delete this category? This cannot be undone.")) return;
+    try {
+      await removeCategory(id);
+      await refreshCategories();
+    } catch (err) {
+      alert("Failed to delete category.");
+    }
+  };
+
+
   // ── Expense tracker: handlers ──────────────────────────────────────
+  const printAdvanceReceipt = (adv: {id: string; autoPrint: boolean}) => {
+    handleOpenPrintModal(adv.id, "advance");
+  };
+
+  const shareAdvanceReceiptWhatsApp = (adv: {id: string; customerName: string; customerPhone: string; total: number; deposit: number; balance: number; items?: { name: string; qty: number; price: number }[]}) => {
+    if (!adv.customerPhone || adv.customerPhone.length < 10) {
+      alert("Invalid customer phone number.");
+      return;
+    }
+    const domain = window.location.origin;
+    const receiptUrl = `${domain}/advance/${adv.id}`;
+    const cleanPhone = adv.customerPhone.replace(/\D/g, "").slice(-10);
+    const fmt = (n: number) => n.toLocaleString("en-IN", { minimumFractionDigits: 2 });
+    
+    const itemsText = adv.items && adv.items.length > 0
+      ? `\nItems:\n` + adv.items.map(i => `- ${i.name} (${i.qty}x) ₹${fmt(i.price)}`).join("\n") + `\n`
+      : "";
+      
+    const text = 
+      `*VIJAYA LAKSHMI*\nAdvance Order Receipt #${adv.id}\n` +
+      `Customer: ${adv.customerName || "Counter Customer"}\n` +
+      itemsText +
+      `\nOrder Total: ₹${fmt(adv.total)}\n` +
+      `Deposit Paid: ₹${fmt(adv.deposit)}\n` +
+      `Balance Due: ₹${fmt(adv.balance)}\n\n` +
+      `Receipt Link:\n${receiptUrl}`;
+      
+    const encoded = encodeURIComponent(text);
+    const url = `https://api.whatsapp.com/send?phone=91${cleanPhone}&text=${encoded}`;
+    window.open(url, "_blank");
+  };
+
   const handleAddExpense = async () => {
     const amountNum =
       typeof expAmount === "number" ? expAmount : parseFloat(String(expAmount));
@@ -2821,48 +3011,22 @@ export default function POSBilling() {
                 </p>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
-                    Selling Price (₹) <span className="text-[#14243D]">*</span>
-                  </label>
-                  <input
-                    type="number"
-                    placeholder="0.00"
-                    className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-bold text-black focus:outline-none transition-colors shadow-xs"
-                    value={newCatPrice}
-                    onWheel={(e) => e.currentTarget.blur()}
-                    onChange={(e) =>
-                      setNewCatPrice(
-                        e.target.value === "" ? "" : parseFloat(e.target.value),
-                      )
-                    }
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
-                    GST Rate (%)
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    step="0.01"
-                    placeholder="18"
-                    className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-bold text-black focus:outline-none transition-colors shadow-xs"
-                    value={newCatGst}
-                    onWheel={(e) => e.currentTarget.blur()}
-                    onChange={(e) =>
-                      setNewCatGst(
-                        e.target.value === "" ? "" : parseFloat(e.target.value),
-                      )
-                    }
-                  />
-                  <p className="text-[9px] text-gray-400 font-semibold mt-1">
-                    Pre-fills at billing (still editable there)
-                  </p>
-                </div>
+              <div>
+                <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
+                  Selling Price (₹) <span className="text-[#14243D]">*</span>
+                </label>
+                <input
+                  type="number"
+                  placeholder="0.00"
+                  className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-bold text-black focus:outline-none transition-colors shadow-xs"
+                  value={newCatPrice}
+                  onWheel={(e) => e.currentTarget.blur()}
+                  onChange={(e) =>
+                    setNewCatPrice(
+                      e.target.value === "" ? "" : parseFloat(e.target.value),
+                    )
+                  }
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -2909,32 +3073,17 @@ export default function POSBilling() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
-                    Batch Number
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g., B12345"
-                    className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
-                    value={newCatBatch}
-                    onChange={(e) => setNewCatBatch(e.target.value)}
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
-                    HSN Code
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g., 6117 or 6204"
-                    className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
-                    value={newCatHsn}
-                    onChange={(e) => setNewCatHsn(e.target.value)}
-                  />
-                </div>
+              <div>
+                <label className="block text-[10px] font-bold text-gray-600 uppercase tracking-widest mb-1.5">
+                  Batch Number
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g., B12345"
+                  className="w-full bg-white border border-gray-200 hover:border-gray-300 focus:border-[#14243D] rounded-lg px-3.5 py-2.5 text-sm font-semibold text-black focus:outline-none transition-colors shadow-xs"
+                  value={newCatBatch}
+                  onChange={(e) => setNewCatBatch(e.target.value)}
+                />
               </div>
 
               <div>
@@ -3268,22 +3417,6 @@ export default function POSBilling() {
               </button>
               <button
                 onClick={() => {
-                  setActiveTab("orders");
-                  setCompletedBillData(null);
-                  if (mainScrollRef.current) mainScrollRef.current.scrollTop = 0;
-                  window.scrollTo({ top: 0, behavior: "instant" });
-                }}
-                className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-xl font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer ${
-                  activeTab === "orders"
-                    ? "bg-white text-[#27272A] shadow-md"
-                    : "text-white/90 hover:bg-white/20 hover:text-white"
-                }`}
-              >
-                <History className="w-5 h-5 shrink-0" />
-                Order History
-              </button>
-              <button
-                onClick={() => {
                   setActiveTab("advance");
                   setCompletedBillData(null);
                   if (mainScrollRef.current) mainScrollRef.current.scrollTop = 0;
@@ -3302,6 +3435,22 @@ export default function POSBilling() {
                     {advanceOrders.filter((a) => a.status === "PENDING" || a.status === "READY").length}
                   </span>
                 )}
+              </button>
+              <button
+                onClick={() => {
+                  setActiveTab("orders");
+                  setCompletedBillData(null);
+                  if (mainScrollRef.current) mainScrollRef.current.scrollTop = 0;
+                  window.scrollTo({ top: 0, behavior: "instant" });
+                }}
+                className={`w-full flex items-center gap-4 px-4 py-3.5 rounded-xl font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer ${
+                  activeTab === "orders"
+                    ? "bg-white text-[#27272A] shadow-md"
+                    : "text-white/90 hover:bg-white/20 hover:text-white"
+                }`}
+              >
+                <History className="w-5 h-5 shrink-0" />
+                Order History
               </button>
               <button
                 onClick={() => {
@@ -3537,7 +3686,7 @@ export default function POSBilling() {
               {/* Action Buttons Bar */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                 <button
-                  onClick={() => setActiveInvoiceId(completedBillData.id)}
+                  onClick={() => handleOpenPrintModal(completedBillData.id, "invoice")}
                   className="bg-white border border-gray-300 hover:bg-gray-50 text-black py-2.5 px-3 rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
                 >
                   <Printer className="w-3.5 h-3.5 text-[#14243D]" />
@@ -4228,12 +4377,19 @@ export default function POSBilling() {
                         <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider">
                           Financial Option
                         </span>
-                        <div className="grid grid-cols-2 gap-2">
-                          {ORDER_PAYMENT_MODES.map((mode) => (
+                        <div className="grid grid-cols-3 gap-2">
+                          {POS_PAYMENT_MODES.map((mode) => (
                             <button
                               key={mode}
                               type="button"
-                              onClick={() => setPaymentMode(mode)}
+                              onClick={() => {
+                                setPaymentMode(mode);
+                                if (mode === "SPLIT") {
+                                  // Suggest split based on total
+                                  setSplitGpay(grandTotal);
+                                  setSplitCash(0);
+                                }
+                              }}
                               className={`py-2 rounded-lg text-xs font-bold tracking-wider uppercase transition-all cursor-pointer border ${
                                 paymentMode === mode
                                   ? "bg-[#14243D] text-white border-[#14243D] shadow-sm"
@@ -4259,45 +4415,76 @@ export default function POSBilling() {
                         </span>
                       </div>
 
-                      {/* Cash / Finance Amount Received */}
-                      <div className="bg-[#FFFFFF]/40 border border-black/10 rounded-xl p-4 mt-2">
-                        <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-0.5">
-                          {paymentMode === "CASH" ? "Cash Payment" : "GPay Payment"}
-                        </span>
-                        <label className="block text-[10px] font-bold text-[#000000] mb-2.5">
-                          Amount Received (₹)
-                        </label>
-                        <input
-                          type="number"
-                          className="w-full bg-white border border-black/10 focus:border-[#14243D] rounded-lg px-3 py-2 text-base font-bold text-[#000000] placeholder:text-[#000000] focus:outline-none transition-colors"
-                          value={cashReceived || ""}
-                          onWheel={(e) => e.currentTarget.blur()}
-                          onChange={(e) =>
-                            setCashReceived(parseFloat(e.target.value) || 0)
-                          }
-                          placeholder="0.00"
-                        />
-                      </div>
+                      {/* Payment Inputs */}
+                      {paymentMode === "SPLIT" ? (
+                        <div className="grid grid-cols-2 gap-3 mt-2">
+                          <div className="bg-[#FFFFFF]/40 border border-black/10 rounded-xl p-3">
+                            <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-0.5">
+                              Cash Portion
+                            </span>
+                            <input
+                              type="number"
+                              className="w-full bg-white border border-black/10 focus:border-[#14243D] rounded-lg px-2 py-1.5 text-sm font-bold text-[#000000] placeholder:text-[#000000] focus:outline-none transition-colors"
+                              value={splitCash || ""}
+                              onWheel={(e) => e.currentTarget.blur()}
+                              onChange={(e) => setSplitCash(parseFloat(e.target.value) || 0)}
+                              placeholder="0.00"
+                            />
+                          </div>
+                          <div className="bg-[#FFFFFF]/40 border border-black/10 rounded-xl p-3">
+                            <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-0.5">
+                              GPay Portion
+                            </span>
+                            <input
+                              type="number"
+                              className="w-full bg-white border border-black/10 focus:border-[#14243D] rounded-lg px-2 py-1.5 text-sm font-bold text-[#000000] placeholder:text-[#000000] focus:outline-none transition-colors"
+                              value={splitGpay || ""}
+                              onWheel={(e) => e.currentTarget.blur()}
+                              onChange={(e) => setSplitGpay(parseFloat(e.target.value) || 0)}
+                              placeholder="0.00"
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="bg-[#FFFFFF]/40 border border-black/10 rounded-xl p-4 mt-2">
+                          <span className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-0.5">
+                            {paymentMode === "CASH" ? "Cash Payment" : "GPay Payment"}
+                          </span>
+                          <label className="block text-[10px] font-bold text-[#000000] mb-2.5">
+                            Amount Received (₹)
+                          </label>
+                          <input
+                            type="number"
+                            className="w-full bg-white border border-black/10 focus:border-[#14243D] rounded-lg px-3 py-2 text-base font-bold text-[#000000] placeholder:text-[#000000] focus:outline-none transition-colors"
+                            value={cashReceived || ""}
+                            onWheel={(e) => e.currentTarget.blur()}
+                            onChange={(e) =>
+                              setCashReceived(parseFloat(e.target.value) || 0)
+                            }
+                            placeholder="0.00"
+                          />
+                        </div>
+                      )}
 
-                      {/* Change Return */}
-                      {cashReceived > 0 && (
-                        <div className="flex justify-between items-center bg-white border border-black/10 rounded-lg p-3 text-xs">
+                      {/* Change Return (only applicable if paying by CASH or SPLIT with cash) */}
+                      {(paymentMode === "CASH" && cashReceived > 0) || (paymentMode === "SPLIT" && splitCash > 0) ? (
+                        <div className="flex justify-between items-center bg-white border border-black/10 rounded-lg p-3 text-xs mt-2">
                           <span className="font-bold text-[#000000] uppercase tracking-[0.05em]">
                             Change Return
                           </span>
                           <span
-                            className={`font-black text-sm ${cashReceived >= grandTotal ? "text-[#00A86B]" : "text-[#27272A]"}`}
+                            className={`font-black text-sm ${(paymentMode === "CASH" ? cashReceived : (splitCash + splitGpay)) >= grandTotal ? "text-[#00A86B]" : "text-[#27272A]"}`}
                           >
                             ₹
                             {Math.max(
                               0,
-                              cashReceived - grandTotal,
+                              (paymentMode === "CASH" ? cashReceived : (splitCash + splitGpay)) - grandTotal,
                             ).toLocaleString(undefined, {
                               minimumFractionDigits: 2,
                             })}
                           </span>
                         </div>
-                      )}
+                      ) : null}
 
                       {/* Complete Sale — saves the order to the database */}
                       <button
@@ -4334,34 +4521,7 @@ export default function POSBilling() {
                         <span>Save as Advance Order</span>
                       </button>
 
-                      {/* Send Bill Button — completes/saves the sale, then shares it via WhatsApp */}
-                      <button
-                        onClick={handleCompleteAndSendWhatsApp}
-                        disabled={isSubmittingOrder}
-                        className={`w-full mt-2 bg-[#10B981] hover:bg-[#059669] text-white py-3 rounded-lg font-bold text-[10px] uppercase tracking-[0.1em] flex items-center justify-center gap-2 transition-all active:scale-[0.98] shadow-[0_4px_14px_rgba(16,185,129,0.4)] ${
-                          isSubmittingOrder
-                            ? "opacity-60 cursor-not-allowed"
-                            : "cursor-pointer"
-                        }`}
-                      >
-                        {isSubmittingOrder ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Processing & Opening WhatsApp...</span>
-                          </>
-                        ) : (
-                          <>
-                            <svg
-                              className="w-3.5 h-3.5"
-                              viewBox="0 0 24 24"
-                              fill="currentColor"
-                            >
-                              <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.012c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z" />
-                            </svg>
-                            <span>Send Bill Via WhatsApp</span>
-                          </>
-                        )}
-                      </button>
+
                     </div>
                   </div>
                 </div>
@@ -4523,89 +4683,7 @@ export default function POSBilling() {
                   </div>
                 )}
 
-                {/* Receive-payment specific fields */}
-                {advanceViewMode === "receive" && selectedAdvance.status !== "COMPLETED" && selectedAdvance.status !== "CANCELLED" && (
-                  <div className="pt-3 border-t border-black/10 space-y-3">
-                    <div>
-                      <label className="block text-[10px] font-bold text-[#000000] uppercase tracking-wider mb-1.5">Manual Discount</label>
-                      <div className="flex gap-2">
-                        <select
-                          value={receiveDiscountType}
-                          onChange={(e) => setReceiveDiscountType(e.target.value as "FIXED" | "PERCENT")}
-                          className="bg-white border border-black/15 rounded-lg px-2 py-2 text-xs font-bold focus:outline-none"
-                        >
-                          <option value="FIXED">₹</option>
-                          <option value="PERCENT">%</option>
-                        </select>
-                        <input
-                          type="number"
-                          value={receiveDiscountValue}
-                          onChange={(e) => setReceiveDiscountValue(e.target.value === "" ? "" : parseFloat(e.target.value))}
-                          onWheel={(e) => e.currentTarget.blur()}
-                          className="flex-1 bg-white border border-black/15 focus:border-[#14243D] rounded-lg px-3 py-2 text-sm font-bold focus:outline-none"
-                          placeholder="0"
-                        />
-                      </div>
-                    </div>
 
-                    <div>
-                      <label className="block text-[10px] font-bold text-[#000000] uppercase tracking-wider mb-1.5">Payment Method</label>
-                      <div className="grid grid-cols-2 gap-2">
-                        {ORDER_PAYMENT_MODES.map((mode) => (
-                          <button
-                            key={mode}
-                            onClick={() => setReceivePaymentMode(mode)}
-                            className={`py-2 rounded-lg text-xs font-bold uppercase tracking-wider border transition-all cursor-pointer ${
-                              receivePaymentMode === mode ? "bg-[#14243D] text-white border-[#14243D]" : "bg-white text-black border-black/10 hover:border-[#14243D]"
-                            }`}
-                          >
-                            {mode === "GPAY" ? "GPay" : mode}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        id="receiveIsGst"
-                        checked={receiveIsGst}
-                        onChange={(e) => setReceiveIsGst(e.target.checked)}
-                        className="w-4 h-4"
-                      />
-                      <label htmlFor="receiveIsGst" className="text-xs font-bold text-black">GST Invoice</label>
-                      {receiveIsGst && (
-                        <input
-                          type="number"
-                          value={receiveGstPct}
-                          onChange={(e) => setReceiveGstPct(parseFloat(e.target.value) || 0)}
-                          onWheel={(e) => e.currentTarget.blur()}
-                          className="w-16 bg-white border border-black/15 rounded px-2 py-1 text-xs font-bold focus:outline-none"
-                        />
-                      )}
-                      {receiveIsGst && <span className="text-xs font-bold">%</span>}
-                    </div>
-
-                    <div className="bg-[#DCFCE7] border border-[#16A34A]/40 rounded-lg p-3 text-center">
-                      <p className="text-[10px] font-bold text-[#166534] uppercase tracking-wider">Final Amount to Collect</p>
-                      <p className="text-2xl font-black text-[#166534]">₹{receiveBalanceFinalAmount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
-                    </div>
-
-                    <p className="text-[10px] font-bold text-[#78350F] bg-[#FEF3C7] border border-[#F59E0B]/30 rounded-lg p-2.5">
-                      Confirmation marks the order Completed, creates one official invoice, and recognizes the full ₹{Number(selectedAdvance.total_amount - receiveBalanceDiscountAmount).toLocaleString(undefined, { minimumFractionDigits: 2 })} as revenue.
-                    </p>
-
-                    <button
-                      onClick={confirmReceiveBalance}
-                      disabled={isFinalizing}
-                      className={`w-full py-3 rounded-lg font-black text-[11px] uppercase tracking-[0.1em] flex items-center justify-center gap-2 bg-[#10B981] hover:bg-[#059669] text-white shadow-md transition-all ${
-                        isFinalizing ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
-                      }`}
-                    >
-                      {isFinalizing ? (<><Loader2 className="w-4 h-4 animate-spin" /><span>Finalizing...</span></>) : (<><Check className="w-4 h-4" /><span>Confirm Final Payment</span></>)}
-                    </button>
-                  </div>
-                )}
               </div>
             </div>
           </div>
@@ -4663,30 +4741,59 @@ export default function POSBilling() {
               })()}
             </div>
 
-            {/* Search + status filter */}
-            <div className="bg-white border border-black/10 rounded-xl p-3 mb-4 flex flex-col md:flex-row gap-3 items-stretch md:items-center">
-              <div className="flex-1 relative">
-                <Search className="w-4 h-4 text-[#9A7A24] absolute left-3 top-1/2 -translate-y-1/2" />
+            {/* Filters */}
+            <div className="flex flex-col sm:flex-row gap-3 mb-6">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
                 <input
                   type="text"
+                  placeholder="Search Advance Orders..."
+                  className="w-full bg-white border border-black/10 rounded-xl pl-9 pr-4 py-2.5 text-xs font-semibold focus:outline-none focus:border-[#14243D] transition-colors"
                   value={advSearchQuery}
                   onChange={(e) => setAdvSearchQuery(e.target.value)}
-                  placeholder="Search by ID, customer, phone, product or status"
-                  className="w-full bg-white border border-black/10 rounded-lg pl-9 pr-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#14243D]"
                 />
               </div>
-              <div className="flex gap-1.5 flex-wrap">
-                {(["ALL", "PENDING", "READY", "COMPLETED", "CANCELLED"] as const).map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => setAdvStatusFilter(s)}
-                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer ${
-                      advStatusFilter === s ? "bg-[#14243D] text-white" : "bg-[#F4F4F5] text-black hover:bg-black/10"
-                    }`}
-                  >
-                    {s === "ALL" ? "All" : s.charAt(0) + s.slice(1).toLowerCase()}
-                  </button>
-                ))}
+              <div className="flex gap-2">
+                <select
+                  value={advPeriod}
+                  onChange={(e) => setAdvPeriod(e.target.value as any)}
+                  className="bg-white border border-black/10 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#14243D] cursor-pointer"
+                >
+                  <option value="all">All Time</option>
+                  <option value="today">Today</option>
+                  <option value="week">This Week</option>
+                  <option value="month">This Month</option>
+                  <option value="year">This Year</option>
+                  <option value="custom">Custom Date</option>
+                </select>
+                {advPeriod === "custom" && (
+                  <div className="flex gap-2 items-center">
+                    <input
+                      type="date"
+                      value={advStartDate}
+                      onChange={(e) => setAdvStartDate(e.target.value)}
+                      className="bg-white border border-black/10 rounded-xl px-2 py-2 text-xs font-semibold"
+                    />
+                    <span className="text-xs text-black/40 font-bold">to</span>
+                    <input
+                      type="date"
+                      value={advEndDate}
+                      onChange={(e) => setAdvEndDate(e.target.value)}
+                      className="bg-white border border-black/10 rounded-xl px-2 py-2 text-xs font-semibold"
+                    />
+                  </div>
+                )}
+                <select
+                  value={advStatusFilter}
+                  onChange={(e) => setAdvStatusFilter(e.target.value as any)}
+                  className="bg-white border border-black/10 rounded-xl px-3 py-2 text-xs font-semibold focus:outline-none focus:border-[#14243D] cursor-pointer"
+                >
+                  <option value="ALL">All Statuses</option>
+                  <option value="PENDING">Pending</option>
+                  <option value="READY">Ready</option>
+                  <option value="COMPLETED">Completed</option>
+                  <option value="CANCELLED">Cancelled</option>
+                </select>
               </div>
             </div>
 
@@ -4704,6 +4811,15 @@ export default function POSBilling() {
               {(() => {
                 const q = advSearchQuery.trim().toLowerCase();
                 const filtered = advanceOrders.filter((a) => {
+                  if (
+                    !isDateInPeriod(
+                      a.created_at,
+                      advPeriod,
+                      advStartDate,
+                      advEndDate,
+                    )
+                  )
+                    return false;
                   if (advStatusFilter !== "ALL" && a.status !== advStatusFilter) return false;
                   if (!q) return true;
                   return (
@@ -4771,26 +4887,50 @@ export default function POSBilling() {
                         )}
                       </div>
                       <div className="flex items-center justify-end gap-1.5 flex-nowrap">
-                        <button onClick={() => openAdvanceView(a)} title="View details" className="w-8 h-8 shrink-0 rounded-lg bg-[#F4F4F5] hover:bg-[#E4E4E7] text-black flex items-center justify-center cursor-pointer">
-                          <Eye className="w-4 h-4" />
+                        <button onClick={() => {
+                          shareAdvanceReceiptWhatsApp({
+                            id: a.id,
+                            customerName: a.customer_name || "Guest",
+                            customerPhone: a.customer_phone,
+                            total: a.total_amount,
+                            deposit: a.deposit_amount,
+                            balance: balanceRemaining(a),
+                            items: a.items.map((i) => ({
+                              name: i.snapshot_name,
+                              qty: i.quantity,
+                              price: Number(i.snapshot_price)
+                            }))
+                          });
+                        }} title="Send on WhatsApp" className="flex items-center justify-center w-8 h-8 bg-[#10B981]/10 hover:bg-[#10B981]/20 text-[#10B981] rounded-md transition-colors cursor-pointer shrink-0">
+                          <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.012c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z" />
+                          </svg>
+                        </button>
+                        <button onClick={() => openAdvanceView(a)} title="View details" className="flex items-center justify-center w-8 h-8 bg-black/5 hover:bg-black/10 text-[#000000] rounded-md transition-colors cursor-pointer shrink-0">
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                          </svg>
                         </button>
                         {a.status !== "COMPLETED" && a.status !== "CANCELLED" && (
-                          <button onClick={() => openReceiveBalance(a)} title="Receive balance" className="w-8 h-8 shrink-0 rounded-lg bg-[#10B981] hover:bg-[#059669] text-white flex items-center justify-center cursor-pointer">
+                          <button onClick={() => openReceiveBalance(a)} title="Receive balance" className="flex items-center justify-center w-8 h-8 bg-[#10B981]/10 hover:bg-[#10B981]/20 text-[#10B981] rounded-md transition-colors cursor-pointer shrink-0">
                             <IndianRupee className="w-4 h-4" />
                           </button>
                         )}
                         {a.status === "COMPLETED" && a.finalized_order_id && (
-                          <button onClick={() => setActiveInvoiceId(a.finalized_order_id)} title="Open invoice" className="w-8 h-8 shrink-0 rounded-lg bg-[#DBEAFE] hover:bg-[#BFDBFE] text-[#1E3A8A] flex items-center justify-center cursor-pointer">
-                            <Receipt className="w-4 h-4" />
+                          <button onClick={() => handleOpenPrintModal(a.finalized_order_id!, "invoice")} title="Open invoice" className="flex items-center justify-center w-8 h-8 bg-[#14243D]/10 hover:bg-[#14243D]/20 text-[#14243D] rounded-md transition-colors cursor-pointer shrink-0">
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
                           </button>
                         )}
                         {a.status !== "COMPLETED" && a.status !== "CANCELLED" && (
-                          <button onClick={() => doCancelAdvance(a)} title="Cancel" className="w-8 h-8 shrink-0 rounded-lg bg-[#FEE2E2] hover:bg-[#FECACA] text-[#991B1B] flex items-center justify-center cursor-pointer">
+                          <button onClick={() => doCancelAdvance(a)} title="Cancel" className="flex items-center justify-center w-8 h-8 bg-[#F59E0B]/10 hover:bg-[#F59E0B]/20 text-[#F59E0B] rounded-md transition-colors cursor-pointer shrink-0">
                             <X className="w-4 h-4" />
                           </button>
                         )}
                         {role === "admin" && (
-                          <button onClick={() => doDeleteAdvance(a)} title="Delete" className="w-8 h-8 shrink-0 rounded-lg bg-[#F4F4F5] hover:bg-[#E4E4E7] text-[#991B1B] flex items-center justify-center cursor-pointer">
+                          <button onClick={() => doDeleteAdvance(a)} title="Delete" className="flex items-center justify-center w-8 h-8 bg-[#DC2626]/10 hover:bg-[#DC2626]/20 text-[#DC2626] rounded-md transition-colors cursor-pointer shrink-0">
                             <Trash2 className="w-4 h-4" />
                           </button>
                         )}
@@ -4962,28 +5102,7 @@ export default function POSBilling() {
                         <option value="OFFLINE">Offline (POS)</option>
                       </select>
                     </div>
-                    <div>
-                      <label className="block text-[9px] font-bold text-[#000000] uppercase tracking-wider mb-1">
-                        Sort By
-                      </label>
-                      <select
-                        className="w-full bg-[#FFFFFF]/30 border border-black/10 focus:border-[#14243D] rounded-lg px-3 py-1.5 text-xs font-bold text-[#000000] focus:outline-none cursor-pointer"
-                        value={`${orderSortField}_${orderSortOrder}`}
-                        onChange={(e) => {
-                          const [f, o] = e.target.value.split("_") as [any, "asc" | "desc"];
-                          setOrderSortField(f);
-                          setOrderSortOrder(o);
-                        }}
-                      >
-                        <option value="date_desc">Date: Newest First</option>
-                        <option value="date_asc">Date: Oldest First</option>
-                        <option value="total_desc">Total: High to Low</option>
-                        <option value="total_asc">Total: Low to High</option>
-                        <option value="id_asc">Order ID: A to Z</option>
-                        <option value="name_asc">Customer Name: A to Z</option>
-                        <option value="status_asc">Status: A to Z</option>
-                      </select>
-                    </div>
+
                   </div>
                 </div>
 
@@ -5204,7 +5323,7 @@ export default function POSBilling() {
                                     </svg>
                                   </button>
                                   <button
-                                    onClick={() => setActiveInvoiceId(order.id)}
+                                    onClick={() => handleOpenPrintModal(order.id, "invoice")}
                                     title="View invoice"
                                     aria-label="View invoice"
                                     className="flex items-center justify-center w-8 h-8 bg-[#14243D]/10 hover:bg-[#14243D]/20 text-[#14243D] rounded-md transition-colors cursor-pointer"
@@ -6866,24 +6985,7 @@ export default function POSBilling() {
                       </option>
                     ))}
                   </select>
-                  <select
-                    value={`${expenseSortField}_${expenseSortOrder}`}
-                    onChange={(e) => {
-                      const [f, o] = e.target.value.split("_") as [any, "asc" | "desc"];
-                      setExpenseSortField(f);
-                      setExpenseSortOrder(o);
-                    }}
-                    className="bg-[#FAFAFA] border border-black/10 rounded-lg px-3 py-2 text-xs font-bold text-[#000000] focus:outline-none focus:border-[#14243D] cursor-pointer"
-                  >
-                    <option value="date_desc">Date: Newest First</option>
-                    <option value="date_asc">Date: Oldest First</option>
-                    <option value="amount_desc">Amount: Highest First</option>
-                    <option value="amount_asc">Amount: Lowest First</option>
-                    <option value="title_asc">Title: A to Z</option>
-                    <option value="title_desc">Title: Z to A</option>
-                    <option value="category_asc">Category: A to Z</option>
-                    <option value="payment_mode_asc">Payment: A to Z</option>
-                  </select>
+
                   <div className="relative">
                     <Search className="w-3.5 h-3.5 text-black/30 absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
@@ -7248,60 +7350,75 @@ export default function POSBilling() {
                   pricing.
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
-                <div className="relative flex-1 lg:flex-none">
-                  <Search className="w-3.5 h-3.5 text-[#000000]/40 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    placeholder="Search products…"
-                    className="pl-9 pr-3 py-2 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D] w-full lg:w-48"
-                    value={inventorySearch}
-                    onChange={(e) => setInventorySearch(e.target.value)}
-                  />
-                </div>
-                <select
-                  value={`${inventorySortField}_${inventorySortOrder}`}
-                  onChange={(e) => {
-                    const [f, o] = e.target.value.split("_") as [any, "asc" | "desc"];
-                    setInventorySortField(f);
-                    setInventorySortOrder(o);
-                  }}
-                  className="bg-white border border-black/10 rounded-lg px-3 py-2 text-xs font-bold text-[#000000] focus:outline-none focus:border-[#14243D] cursor-pointer"
-                >
-                  <option value="name_asc">Name: A to Z</option>
-                  <option value="name_desc">Name: Z to A</option>
-                  <option value="price_asc">Price: Low to High</option>
-                  <option value="price_desc">Price: High to Low</option>
-                  <option value="stock_desc">Stock: High to Low</option>
-                  <option value="stock_asc">Stock: Low to High</option>
-                  <option value="gst_desc">GST: High to Low</option>
-                  <option value="brand_asc">Brand: A to Z</option>
-                </select>
+              <div className="flex gap-2 p-1 bg-black/5 rounded-xl border border-black/10 shrink-0">
                 <button
-                  onClick={exportInventoryCSV}
-                  className="text-[10px] font-bold text-[#000000] bg-white border border-black/10 hover:bg-[#FAFAFA] px-3 py-2 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
+                  onClick={() => setInventoryView("products")}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
+                    inventoryView === "products" ? "bg-white text-[#14243D] shadow-sm" : "text-black/60 hover:text-black"
+                  }`}
                 >
-                  <Download className="w-3.5 h-3.5 text-[#14243D]" /> Inventory CSV
+                  Products
                 </button>
                 <button
-                  onClick={exportStockReportCSV}
-                  className="text-[10px] font-bold text-[#000000] bg-white border border-black/10 hover:bg-[#FAFAFA] px-3 py-2 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
+                  onClick={() => setInventoryView("stockReport")}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
+                    inventoryView === "stockReport" ? "bg-white text-[#14243D] shadow-sm" : "text-black/60 hover:text-black"
+                  }`}
                 >
-                  <Download className="w-3.5 h-3.5 text-[#14243D]" /> Stock Report
-                </button>
-                <button
-                  onClick={() => {
-                    resetCatalogForm();
-                    setEditingCatalogId(null);
-                    setCatalogTargetRowId(null);
-                    setShowCatalogModal(true);
-                  }}
-                  className="text-[10px] font-bold text-white bg-[#14243D] hover:bg-[#27272A] px-3 py-2 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
-                >
-                  <Plus className="w-3.5 h-3.5" /> Add Product
+                  Stock Ledger
                 </button>
               </div>
             </div>
+
+            {inventoryView === "products" && (
+              <>
+                <div className="flex flex-wrap items-center gap-2 mb-4 w-full justify-between lg:justify-end">
+                  <div className="relative flex-1 lg:flex-none">
+                    <Search className="w-3.5 h-3.5 text-[#000000]/40 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      placeholder="Search products…"
+                      className="pl-9 pr-3 py-2 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D] w-full lg:w-48"
+                      value={inventorySearch}
+                      onChange={(e) => setInventorySearch(e.target.value)}
+                    />
+                  </div>
+                  <select
+                    value={`${inventorySortField}_${inventorySortOrder}`}
+                    onChange={(e) => {
+                      const [f, o] = e.target.value.split("_") as [any, "asc" | "desc"];
+                      setInventorySortField(f);
+                      setInventorySortOrder(o);
+                    }}
+                    className="bg-white border border-black/10 rounded-lg px-3 py-2 text-xs font-bold text-[#000000] focus:outline-none focus:border-[#14243D] cursor-pointer"
+                  >
+                    <option value="name_asc">Name: A to Z</option>
+                    <option value="name_desc">Name: Z to A</option>
+                    <option value="price_asc">Price: Low to High</option>
+                    <option value="price_desc">Price: High to Low</option>
+                    <option value="stock_desc">Stock: High to Low</option>
+                    <option value="stock_asc">Stock: Low to High</option>
+                    <option value="gst_desc">GST: High to Low</option>
+                    <option value="brand_asc">Brand: A to Z</option>
+                  </select>
+                  <button
+                    onClick={exportInventoryCSV}
+                    className="text-[10px] font-bold text-[#000000] bg-white border border-black/10 hover:bg-[#FAFAFA] px-3 py-2 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5 text-[#14243D]" /> Inventory CSV
+                  </button>
+                  <button
+                    onClick={() => {
+                      resetCatalogForm();
+                      setEditingCatalogId(null);
+                      setCatalogTargetRowId(null);
+                      setShowCatalogModal(true);
+                    }}
+                    className="text-[10px] font-bold text-white bg-[#14243D] hover:bg-[#27272A] px-3 py-2 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Add Product
+                  </button>
+                </div>
 
             {inventoryProducts.length === 0 ? (
               <div className="bg-white border border-black/10 rounded-xl p-12 text-center">
@@ -7370,30 +7487,6 @@ export default function POSBilling() {
                           <div className="flex items-center justify-end gap-1.5">
                             <span>Price</span>
                             {inventorySortField === "price" ? (
-                              inventorySortOrder === "asc" ? (
-                                <ArrowUp className="w-3 h-3 text-[#14243D]" />
-                              ) : (
-                                <ArrowDown className="w-3 h-3 text-[#14243D]" />
-                              )
-                            ) : (
-                              <ArrowUpDown className="w-3 h-3 text-black/30" />
-                            )}
-                          </div>
-                        </th>
-                        <th
-                          onClick={() => {
-                            if (inventorySortField === "gst") {
-                              setInventorySortOrder((prev) => (prev === "asc" ? "desc" : "asc"));
-                            } else {
-                              setInventorySortField("gst");
-                              setInventorySortOrder("desc");
-                            }
-                          }}
-                          className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-center cursor-pointer hover:bg-black/5 transition-colors"
-                        >
-                          <div className="flex items-center justify-center gap-1.5">
-                            <span>GST %</span>
-                            {inventorySortField === "gst" ? (
                               inventorySortOrder === "asc" ? (
                                 <ArrowUp className="w-3 h-3 text-[#14243D]" />
                               ) : (
@@ -7526,11 +7619,6 @@ export default function POSBilling() {
                                         {p.desc}
                                       </div>
                                     )}
-                                    {p.hsnCode && (
-                                      <div className="text-[9px] font-bold text-[#000000]/40 mt-0.5 uppercase tracking-wider">
-                                        HSN {p.hsnCode}
-                                      </div>
-                                    )}
                                   </div>
                                 </div>
                               </td>
@@ -7539,9 +7627,6 @@ export default function POSBilling() {
                                 {(p.price ?? 0).toLocaleString(undefined, {
                                   minimumFractionDigits: 2,
                                 })}
-                              </td>
-                              <td className="p-3 text-center text-sm font-bold text-[#000000]/70">
-                                {p.gstRate ?? 0}%
                               </td>
                               <td className="p-3 text-center">
                                 <div
@@ -7624,7 +7709,7 @@ export default function POSBilling() {
                                           </h4>
                                         </div>
                                         <p className="text-[10px] text-black/60 font-semibold mt-0.5">
-                                          HSN: {p.hsnCode || "—"} • GST Rate: {p.gstRate ?? 0}% • Available Stock: {stock} pcs • Minimum Threshold: {threshold} pcs
+                                          Available Stock: {stock} pcs • Minimum Threshold: {threshold} pcs
                                         </p>
                                       </div>
                                       <div className="flex items-center gap-2">
@@ -7755,6 +7840,55 @@ export default function POSBilling() {
                       )}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            )}
+            </>
+            )}
+
+            {inventoryView === "stockReport" && (
+              <div className="mt-6 space-y-4">
+                <div className="flex justify-end mb-4">
+                  <button
+                    onClick={exportStockReportCSV}
+                    className="text-[10px] font-bold text-[#000000] bg-white border border-black/10 hover:bg-[#FAFAFA] px-4 py-2.5 rounded-lg uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm"
+                  >
+                    <Download className="w-3.5 h-3.5 text-[#14243D]" /> Export Stock Ledger (CSV)
+                  </button>
+                </div>
+                <div className="bg-white border border-black/10 rounded-xl overflow-hidden shadow-xs">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse min-w-[900px]">
+                      <thead className="bg-[#FAFAFA] border-b border-black/10 select-none">
+                        <tr>
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">Date & Time</th>
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">Movement</th>
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">Product Name</th>
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-right">Qty Delta</th>
+                          <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">Note</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-black/10">
+                        {stockMovements.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="p-8 text-center text-xs font-semibold text-[#000000]/60">
+                              No stock movements found.
+                            </td>
+                          </tr>
+                        ) : (
+                          stockMovements.map(m => (
+                            <tr key={m.id} className="hover:bg-black/5 transition-colors">
+                              <td className="p-3 text-xs font-semibold text-black/80">{new Date(m.moved_at).toLocaleString('en-IN')}</td>
+                              <td className="p-3 text-xs font-black text-black">{m.movement_type}</td>
+                              <td className="p-3 text-xs font-bold text-[#14243D]">{m.snapshot_name}</td>
+                              <td className={`p-3 text-xs font-black text-right ${m.quantity > 0 ? 'text-[#10B981]' : 'text-[#DC2626]'}`}>{m.quantity > 0 ? '+' : ''}{m.quantity}</td>
+                              <td className="p-3 text-xs font-semibold text-black/60">{m.reason || "—"}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
             )}
@@ -7922,38 +8056,85 @@ export default function POSBilling() {
           </div>
         )}
 
-        {/* Invoice Modal */}
-        {activeInvoiceId && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-xs z-[400] flex items-center justify-center p-2 sm:p-4 animate-in fade-in duration-150">
-            <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl h-[92vh] sm:h-[88vh] flex flex-col overflow-hidden border border-neutral-300 transform scale-100 animate-in zoom-in-95 duration-150">
-              <div className="px-4 py-2.5 flex justify-between items-center bg-neutral-900 text-white border-b border-neutral-800 shrink-0">
-                <h3 className="font-bold text-xs uppercase tracking-wider flex items-center gap-2 text-white">
-                  <Printer className="w-3.5 h-3.5 text-neutral-300" />
-                  <span>Invoice Preview • #{activeInvoiceId}</span>
+        {/* Print Settings Modal */}
+        {printSettingsModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden transform scale-100 animate-in zoom-in-95 duration-200 border border-black/10">
+              <div className="p-4 border-b border-black/10 flex justify-between items-center bg-[#F9FAFB]">
+                <h3 className="font-black text-sm text-black uppercase tracking-wider flex items-center gap-2">
+                  <Printer className="w-4 h-4 text-[#14243D]" />
+                  Print Settings
                 </h3>
-                <div className="flex items-center gap-2">
-                  <a
-                    href={`/invoice/${activeInvoiceId}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[11px] font-semibold text-neutral-300 hover:text-white px-2.5 py-1 bg-white/10 hover:bg-white/20 rounded transition-colors"
-                  >
-                    Open Full Page ↗
-                  </a>
-                  <button
-                    onClick={() => setActiveInvoiceId(null)}
-                    className="w-7 h-7 flex items-center justify-center bg-white/10 hover:bg-white/20 text-white rounded transition-colors cursor-pointer"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
+                <button onClick={() => setPrintSettingsModal(null)} className="text-black/40 hover:text-black">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-6 space-y-6 bg-white">
+                <div>
+                  <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-3">Printer Type</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => setPrintPrefs(p => ({ ...p, paper: 'thermal', size: '80' }))}
+                      className={`p-3 rounded-xl border ${printPrefs.paper === 'thermal' ? 'border-[#14243D] bg-[#14243D]/5' : 'border-black/10 bg-white hover:bg-black/5'} flex flex-col items-center gap-2 transition-colors cursor-pointer`}
+                    >
+                      <Receipt className={`w-6 h-6 ${printPrefs.paper === 'thermal' ? 'text-[#14243D]' : 'text-black/60'}`} />
+                      <span className={`text-xs font-bold ${printPrefs.paper === 'thermal' ? 'text-[#14243D]' : 'text-black/70'}`}>Thermal Printer</span>
+                    </button>
+                    <button
+                      onClick={() => setPrintPrefs(p => ({ ...p, paper: 'a4', size: 'a4' }))}
+                      className={`p-3 rounded-xl border ${printPrefs.paper === 'a4' ? 'border-[#14243D] bg-[#14243D]/5' : 'border-black/10 bg-white hover:bg-black/5'} flex flex-col items-center gap-2 transition-colors cursor-pointer`}
+                    >
+                      <List className={`w-6 h-6 ${printPrefs.paper === 'a4' ? 'text-[#14243D]' : 'text-black/60'}`} />
+                      <span className={`text-xs font-bold ${printPrefs.paper === 'a4' ? 'text-[#14243D]' : 'text-black/70'}`}>Sheet Printer</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-3">Paper Size</label>
+                  <div className="grid grid-cols-2 gap-3">
+                    {printPrefs.paper === 'thermal' ? (
+                      <>
+                        <button
+                          onClick={() => setPrintPrefs(p => ({ ...p, size: '58' }))}
+                          className={`p-2 rounded-lg border ${printPrefs.size === '58' ? 'border-[#14243D] bg-[#14243D] text-white' : 'border-black/10 bg-white text-black hover:bg-black/5'} text-xs font-bold transition-colors cursor-pointer`}
+                        >
+                          58mm (2-inch)
+                        </button>
+                        <button
+                          onClick={() => setPrintPrefs(p => ({ ...p, size: '80' }))}
+                          className={`p-2 rounded-lg border ${printPrefs.size === '80' ? 'border-[#14243D] bg-[#14243D] text-white' : 'border-black/10 bg-white text-black hover:bg-black/5'} text-xs font-bold transition-colors cursor-pointer`}
+                        >
+                          80mm (3-inch)
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => setPrintPrefs(p => ({ ...p, size: 'a4' }))}
+                          className={`p-2 rounded-lg border ${printPrefs.size === 'a4' ? 'border-[#14243D] bg-[#14243D] text-white' : 'border-black/10 bg-white text-black hover:bg-black/5'} text-xs font-bold transition-colors cursor-pointer`}
+                        >
+                          A4 Sheet
+                        </button>
+                        <button
+                          onClick={() => setPrintPrefs(p => ({ ...p, size: 'a5' }))}
+                          className={`p-2 rounded-lg border ${printPrefs.size === 'a5' ? 'border-[#14243D] bg-[#14243D] text-white' : 'border-black/10 bg-white text-black hover:bg-black/5'} text-xs font-bold transition-colors cursor-pointer`}
+                        >
+                          A5 Sheet
+                        </button>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
-              <div className="flex-1 w-full bg-neutral-100 overflow-hidden relative">
-                <iframe
-                  src={`/invoice/${activeInvoiceId}?embed=true`}
-                  className="w-full h-full border-none absolute inset-0"
-                  title={`Invoice ${activeInvoiceId}`}
-                />
+              <div className="p-4 border-t border-black/10 bg-[#F9FAFB] flex justify-end">
+                <button
+                  onClick={executePrint}
+                  className="bg-[#14243D] hover:bg-black text-white px-6 py-2.5 rounded-xl text-[10px] font-bold uppercase tracking-wider shadow-md transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  <Printer className="w-4 h-4" />
+                  Proceed to Print
+                </button>
               </div>
             </div>
           </div>
@@ -8034,6 +8215,242 @@ export default function POSBilling() {
           </div>
         )}
 
+        {/* Advance Receipt Modal */}
+        {advanceReceipt && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden transform scale-100 animate-in zoom-in-95 duration-200">
+              <div className="p-6 text-center">
+                <div className="w-16 h-16 bg-[#DCFCE7] rounded-full mx-auto flex items-center justify-center mb-4">
+                  <Check className="w-8 h-8 text-[#16A34A]" />
+                </div>
+                <h2 className="text-xl font-black text-black mb-1">Advance Saved!</h2>
+                <p className="text-xs text-black/60 mb-6 font-semibold">Deposit collected successfully.</p>
+                
+                <div className="bg-gray-50 rounded-xl p-4 text-left space-y-2 mb-6">
+                  <div className="flex justify-between text-xs font-bold">
+                    <span className="text-black/60">ID:</span>
+                    <span className="text-black">{advanceReceipt.id}</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-bold">
+                    <span className="text-black/60">Total:</span>
+                    <span className="text-black">₹{advanceReceipt.total.toFixed(2)}</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-bold">
+                    <span className="text-black/60">Deposit:</span>
+                    <span className="text-[#16A34A]">₹{advanceReceipt.deposit.toFixed(2)}</span>
+                  </div>
+                  <div className="pt-2 border-t border-black/10 flex justify-between text-sm font-black">
+                    <span className="text-black/60">Balance:</span>
+                    <span className="text-[#DC2626]">₹{advanceReceipt.balance.toFixed(2)}</span>
+                  </div>
+                </div>
+
+                {/* Items Sold Card */}
+                {advanceReceipt.items && advanceReceipt.items.length > 0 && (
+                  <div className="bg-white rounded-xl p-4 sm:p-5 border border-black/10 shadow-xs space-y-3 mb-6 text-left">
+                    <div className="text-[10px] font-extrabold text-gray-400 uppercase tracking-widest border-b border-gray-100 pb-2">
+                      Items Sold
+                    </div>
+                    <div className="space-y-2 max-h-[150px] overflow-y-auto pr-1">
+                      {advanceReceipt.items.map((item, idx) => (
+                        <div key={idx} className="flex justify-between items-center text-xs py-1 border-b border-gray-50 last:border-none">
+                          <span className="font-semibold text-black">
+                            {item.name} <span className="text-gray-400 font-bold text-[10px] ml-1">× {item.qty} {item.qty === 1 ? "piece" : "pieces"}</span>
+                          </span>
+                          <span className="font-bold text-black">
+                            ₹{(item.price * item.qty).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <button
+                    onClick={() => printAdvanceReceipt({ id: advanceReceipt.id, autoPrint: true })}
+                    className="w-full py-3 bg-[#14243D] hover:bg-[#27272A] text-white rounded-xl font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2"
+                  >
+                    <Printer className="w-4 h-4" /> Print Receipt
+                  </button>
+                  <button
+                    onClick={() => shareAdvanceReceiptWhatsApp(advanceReceipt)}
+                    className="w-full py-3 bg-[#25D366] hover:bg-[#22C35E] text-white rounded-xl font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2"
+                  >
+                    <MessageCircle className="w-4 h-4" /> WhatsApp Receipt
+                  </button>
+                  <button
+                    onClick={() => setAdvanceReceipt(null)}
+                    className="w-full py-3 bg-gray-100 hover:bg-gray-200 text-black rounded-xl font-bold text-[10px] uppercase tracking-wider"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Receive Balance Modal */}
+        {advanceViewMode === "receive" && selectedAdvance && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden transform scale-100 animate-in zoom-in-95 duration-200 border border-black/10">
+              <div className="p-4 border-b border-black/10 flex justify-between items-center bg-[#F9FAFB]">
+                <h3 className="font-black text-sm text-black uppercase tracking-wider">Finalize Advance Sale</h3>
+                <button onClick={() => setAdvanceViewMode(null)} className="text-black/40 hover:text-black">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              
+              <div className="p-6 space-y-5">
+                <div className="bg-[#FEF3C7] border border-[#F59E0B]/30 rounded-xl p-4 flex justify-between items-center">
+                  <div>
+                    <div className="text-[10px] font-bold text-[#9A7A24] uppercase tracking-wider">Outstanding Balance Due</div>
+                    <div className="text-2xl font-black text-[#B45309]">₹{(selectedAdvance.subtotal - selectedAdvance.deposit_amount).toFixed(2)}</div>
+                  </div>
+                  <div className="text-right text-xs font-semibold text-[#B45309]/80">
+                    <div>Total: ₹{selectedAdvance.subtotal.toFixed(2)}</div>
+                    <div>Paid: ₹{selectedAdvance.deposit_amount.toFixed(2)}</div>
+                  </div>
+                </div>
+
+                {/* Items Sold Card */}
+                {selectedAdvance.items && selectedAdvance.items.length > 0 && (
+                  <div className="bg-white rounded-xl p-4 sm:p-5 border border-black/10 shadow-xs space-y-3 text-left">
+                    <div className="text-[10px] font-extrabold text-gray-400 uppercase tracking-widest border-b border-gray-100 pb-2">
+                      Items Sold
+                    </div>
+                    <div className="space-y-2 max-h-[150px] overflow-y-auto pr-1">
+                      {selectedAdvance.items.map((item, idx) => (
+                        <div key={idx} className="flex justify-between items-center text-xs py-1 border-b border-gray-50 last:border-none">
+                          <span className="font-semibold text-black">
+                            {item.snapshot_name} <span className="text-gray-400 font-bold text-[10px] ml-1">× {item.quantity} {item.quantity === 1 ? "piece" : "pieces"}</span>
+                          </span>
+                          <span className="font-bold text-black">
+                            ₹{(Number(item.snapshot_price) * item.quantity).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-2">Discount Type</label>
+                    <select
+                      value={receiveDiscountType}
+                      onChange={(e) => setReceiveDiscountType(e.target.value as any)}
+                      className="w-full bg-white border border-black/10 rounded-xl px-3 py-2 text-sm font-semibold focus:outline-none focus:border-[#14243D]"
+                    >
+                      <option value="FIXED">Fixed Amount (₹)</option>
+                      <option value="PERCENT">Percentage (%)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-2">Discount Value</label>
+                    <input
+                      type="number"
+                      value={receiveDiscountValue}
+                      onChange={(e) => setReceiveDiscountValue(e.target.value === "" ? "" : Number(e.target.value))}
+                      placeholder="0.00"
+                      className="w-full bg-white border border-black/10 rounded-xl px-3 py-2 text-sm font-semibold focus:outline-none focus:border-[#14243D]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-2">Balance Payment Mode</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {ORDER_PAYMENT_MODES.map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setReceivePaymentMode(mode)}
+                        className={`py-2 rounded-lg text-xs font-bold tracking-wider uppercase transition-all border ${receivePaymentMode === mode ? "bg-[#14243D] text-white border-[#14243D]" : "bg-white text-black border-black/10"}`}
+                      >
+                        {mode === "GPAY" ? "GPay" : mode}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+              </div>
+
+              <div className="p-4 border-t border-black/10 flex gap-3 bg-[#F9FAFB]">
+                <button
+                  onClick={() => setAdvanceViewMode(null)}
+                  disabled={isFinalizing}
+                  className="flex-1 py-3 bg-white border border-black/10 rounded-xl text-[10px] font-bold text-black uppercase tracking-wider hover:bg-gray-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={confirmReceiveBalance}
+                  disabled={isFinalizing}
+                  className="flex-[2] py-3 bg-[#16A34A] hover:bg-[#15803D] text-white rounded-xl text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-2"
+                >
+                  {isFinalizing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                  {isFinalizing ? "Processing..." : "Receive Balance & Complete"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Category Modal */}
+        {showCategoryModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden transform scale-100 animate-in zoom-in-95 duration-200 border border-black/10">
+              <div className="p-4 border-b border-black/10 flex justify-between items-center bg-[#F9FAFB]">
+                <h3 className="font-black text-sm text-black uppercase tracking-wider">Manage Categories</h3>
+                <button onClick={() => setShowCategoryModal(false)} className="text-black/40 hover:text-black">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-4 bg-gray-50 flex gap-2">
+                <input 
+                  type="text" 
+                  value={newCategoryName} 
+                  onChange={e => setNewCategoryName(e.target.value)} 
+                  placeholder="New category name"
+                  className="flex-1 bg-white border border-black/10 rounded-xl px-3 py-2 text-sm font-semibold focus:outline-none focus:border-[#14243D]"
+                />
+                <button onClick={handleAddCategory} disabled={isSavingCategory} className="bg-[#14243D] text-white px-4 py-2 rounded-xl text-xs font-bold uppercase cursor-pointer hover:bg-black">Add</button>
+              </div>
+              <div className="max-h-[50vh] overflow-y-auto p-4 space-y-2">
+                {categories.map((c) => (
+                  <div key={c.id} className="flex justify-between items-center p-3 bg-white border border-black/10 rounded-xl shadow-sm">
+                    {editingCategoryId === c.id ? (
+                      <input 
+                        autoFocus
+                        value={editCategoryName}
+                        onChange={e => setEditCategoryName(e.target.value)}
+                        className="flex-1 bg-gray-50 border border-black/20 rounded-md px-2 py-1 text-sm font-semibold focus:outline-none"
+                      />
+                    ) : (
+                      <span className="font-bold text-sm text-black">{c.name}</span>
+                    )}
+                    
+                    <div className="flex gap-2 ml-4">
+                      {editingCategoryId === c.id ? (
+                        <>
+                          <button onClick={handleSaveEditCategory} disabled={isSavingCategory} className="text-[#16A34A] hover:opacity-70"><Check className="w-4 h-4" /></button>
+                          <button onClick={() => setEditingCategoryId(null)} className="text-black/40 hover:text-black"><X className="w-4 h-4" /></button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => {setEditingCategoryId(c.id); setEditCategoryName(c.name);}} className="text-black/40 hover:text-black"><Pencil className="w-4 h-4" /></button>
+                          <button onClick={() => handleDeleteCategory(c.id)} className="text-[#DC2626] hover:opacity-70"><Trash2 className="w-4 h-4" /></button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Classy Footer */}
         <footer className="mt-auto pt-10 pb-2 border-t border-black/10 flex flex-col md:flex-row justify-between items-center text-[10px] text-[#000000] font-semibold uppercase tracking-wider gap-4">

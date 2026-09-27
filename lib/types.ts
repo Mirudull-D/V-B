@@ -62,7 +62,7 @@ export type Customer = {
   created_at: string;
 };
 
-export type PaymentMode = 'CASH' | 'GPAY';
+export type PaymentMode = 'CASH' | 'GPAY' | 'SPLIT';
 
 export type OrderRow = {
   id: string;
@@ -78,7 +78,9 @@ export type OrderRow = {
   gst_amount: number; // GST inside subtotal-discount (derived)
   delivery_fee: number;
   grand_total: number; // = subtotal - discount + delivery
-  cash_received: number;
+  cash_received: number; // total amount tendered (cash for CASH, gpay amount for GPAY, cash+gpay for SPLIT)
+  split_cash: number; // cash portion when payment_mode = SPLIT
+  split_gpay: number; // gpay portion when payment_mode = SPLIT
   payment_mode: PaymentMode;
   bill_date: string;
   created_at: string;

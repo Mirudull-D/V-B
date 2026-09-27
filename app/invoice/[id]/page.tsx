@@ -95,6 +95,9 @@ export default async function InvoicePage({
   const { id } = await params;
   const resolvedSearchParams = searchParams ? await searchParams : {};
   const isEmbed = resolvedSearchParams.embed === "true";
+  const isAutoPrint = resolvedSearchParams.print === "true";
+  const paper = resolvedSearchParams.paper as string || "a4";
+  const size = resolvedSearchParams.size as string || "a4";
 
   const order = await dbStore.getOrderWithRelations(id);
 
@@ -146,6 +149,94 @@ export default async function InvoicePage({
     timeZone: "Asia/Kolkata",
   });
 
+  if (paper === "thermal") {
+    const widthClass = size === "58" ? "max-w-[260px]" : "max-w-[320px]";
+    return (
+      <div className="min-h-screen bg-zinc-100/70 text-black font-mono flex flex-col items-center py-4 print:bg-white print:p-0 print:m-0">
+        <style>{`
+          @media print {
+            @page {
+              size: ${size}mm auto;
+              margin: 3mm;
+            }
+            html, body {
+              background: #ffffff !important;
+              color: #000000 !important;
+              padding: 0 !important;
+              margin: 0 !important;
+              -webkit-print-color-adjust: exact !important;
+              print-color-adjust: exact !important;
+            }
+            .print-hidden {
+              display: none !important;
+            }
+          }
+        `}</style>
+        {isAutoPrint && (
+          <script dangerouslySetInnerHTML={{ __html: `setTimeout(() => window.print(), 500);` }} />
+        )}
+        <div className={`w-full ${widthClass} bg-white p-3 text-[10px] leading-tight shadow-sm print:shadow-none`}>
+          <div className="text-center font-bold text-sm mb-1 border-b border-dashed border-black/30 pb-2">
+            VIJAYA LAKSHMI INDUSTRIES<br/>
+            <span className="text-[10px] font-normal">Pure Camphor & Puja Products</span>
+          </div>
+          <div className="py-2 border-b border-dashed border-black/30">
+            <div>Order: #{order.id}</div>
+            <div>Date: {formattedDate} {formattedTime}</div>
+            {order.customer_name && <div>Customer: {order.customer_name}</div>}
+            {order.customer_phone && <div>Phone: {order.customer_phone}</div>}
+            <div>Bill Type: {order.is_gst ? "GST Invoice" : "Non-GST"}</div>
+          </div>
+          
+          <table className="w-full my-2">
+            <thead className="border-b border-dashed border-black/30 text-left font-bold">
+              <tr>
+                <th className="py-1">Item</th>
+                <th className="py-1 text-right">Qty</th>
+                <th className="py-1 text-right">Amt</th>
+              </tr>
+            </thead>
+            <tbody>
+              {order.items.map((item, idx) => (
+                <tr key={idx}>
+                  <td className="py-1 pr-1 truncate max-w-[120px]">{item.snapshot_name}</td>
+                  <td className="py-1 text-right">{item.quantity}</td>
+                  <td className="py-1 text-right">{(Number(item.snapshot_price) * Number(item.quantity)).toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          
+          <div className="border-t border-dashed border-black/30 pt-2 space-y-1">
+            <div className="flex justify-between">
+              <span>Subtotal:</span>
+              <span>₹{subtotalNum.toFixed(2)}</span>
+            </div>
+            {discountNum > 0 && (
+              <div className="flex justify-between">
+                <span>Discount:</span>
+                <span>-₹{discountNum.toFixed(2)}</span>
+              </div>
+            )}
+            <div className="flex justify-between font-bold text-xs mt-1 border-t border-dashed border-black/30 pt-1">
+              <span>Total:</span>
+              <span>₹{grandTotalNum.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Payment ({order.payment_mode}):</span>
+              <span>₹{grandTotalNum.toFixed(2)}</span>
+            </div>
+          </div>
+          <div className="mt-2 text-center text-[9px] border-t border-dashed border-black/30 pt-2">
+            {numberToWords(grandTotalNum)}
+            <br/><br/>
+            Thank You! Visit Again.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`min-h-screen bg-zinc-100/70 text-zinc-900 font-sans ${
@@ -156,8 +247,8 @@ export default async function InvoicePage({
       <style>{`
         @media print {
           @page {
-            size: A4 portrait;
-            margin: 12mm 10mm;
+            size: ${size === 'a5' ? 'A5' : 'A4'} portrait;
+            margin: ${size === 'a5' ? '10mm' : '12mm'};
           }
           html, body {
             background: #ffffff !important;
@@ -179,6 +270,10 @@ export default async function InvoicePage({
           }
         }
       `}</style>
+      
+      {isAutoPrint && (
+        <script dangerouslySetInnerHTML={{ __html: `setTimeout(() => window.print(), 500);` }} />
+      )}
 
       {/* Top Action Toolbar (Hidden in print and embed) */}
       {!isEmbed && (

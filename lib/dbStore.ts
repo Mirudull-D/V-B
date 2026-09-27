@@ -71,6 +71,21 @@ export const dbStore = {
     return rows[0] as Category;
   },
 
+  async updateCategory(id: string, name: string): Promise<Category | null> {
+    const existing = await sql`SELECT * FROM categories WHERE id = ${id}`;
+    if (existing.length === 0) return null;
+    const oldName = (existing[0] as Category).name;
+    const newName = name.trim();
+    if (!newName || newName === oldName) return existing[0] as Category;
+
+    const rows = await sql`
+      UPDATE categories SET name = ${newName} WHERE id = ${id} RETURNING *
+    `;
+    // Keep products in sync — their category is stored as the name string.
+    await sql`UPDATE products SET category = ${newName} WHERE category = ${oldName}`;
+    return rows[0] as Category;
+  },
+
   async deleteCategory(id: string): Promise<void> {
     await sql`DELETE FROM categories WHERE id = ${id}`;
   },
@@ -354,6 +369,8 @@ export const dbStore = {
     deliveryFee: number;
     grandTotal: number;
     cashReceived: number;
+    splitCash?: number;
+    splitGpay?: number;
     paymentMode: PaymentMode;
   }): Promise<{ orderId: string }> {
     // Neon HTTP doesn't natively support full interactive transactions in the simple API,
@@ -459,14 +476,15 @@ export const dbStore = {
         INSERT INTO orders (
           id, customer_id, source, status, is_gst, subtotal, discount_type, discount_value,
           discount_amount, gst_percentage, gst_amount, delivery_fee, grand_total,
-          cash_received, payment_mode, bill_date, created_at
+          cash_received, split_cash, split_gpay, payment_mode, bill_date, created_at
         ) VALUES (
           ${payload.orderId}, ${customer.id}, ${payload.source}, 'COMPLETED', ${payload.isGst},
           ${subtotalInclusive},
           ${payload.discountType}, ${payload.discountValue}, ${payload.discountAmount},
           ${payload.gstPercentage}, ${payload.gstAmount}, ${payload.deliveryFee},
-          ${payload.grandTotal}, ${payload.cashReceived}, ${payload.paymentMode},
-          ${payload.billDate}, now()
+          ${payload.grandTotal}, ${payload.cashReceived},
+          ${payload.splitCash ?? 0}, ${payload.splitGpay ?? 0},
+          ${payload.paymentMode}, ${payload.billDate}, now()
         )
       `,
       ...batchUpdates.map((u) =>
