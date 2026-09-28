@@ -1,7 +1,7 @@
 "use server";
 
 import { dbStore } from "@/lib/dbStore";
-import { Product, ProductBatch, ProductWithBatches, StockMovement, OrderWithRelations, CartItem, Expense, PaymentMode, Category, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
+import { Product, ProductBatch, ProductWithBatches, StockMovement, OrderWithRelations, CartItem, Expense, PaymentMode, Category, Service, AdvanceOrderWithRelations, AdvanceOrderStatus } from "@/lib/types";
 
 // Helper to serialize Date objects from Postgres to strings
 function serialize<T>(data: T): T {
@@ -40,6 +40,23 @@ export async function renameCategory(id: string, name: string): Promise<Category
 
 export async function removeCategory(id: string): Promise<void> {
   return await dbStore.deleteCategory(id);
+}
+
+// Services (name + price only — billed as snapshot line items, no stock)
+export async function fetchServices(): Promise<Service[]> {
+  return serialize(await dbStore.listServices());
+}
+
+export async function createService(data: { name: string; price: number }): Promise<Service> {
+  return serialize(await dbStore.addService({ name: data.name.trim(), price: data.price }));
+}
+
+export async function editService(id: string, data: Partial<Service>): Promise<Service | null> {
+  return serialize(await dbStore.updateService(id, data));
+}
+
+export async function removeService(id: string): Promise<void> {
+  return await dbStore.deleteService(id);
 }
 
 // Products

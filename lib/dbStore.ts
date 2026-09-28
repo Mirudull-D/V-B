@@ -16,6 +16,7 @@ import {
   AdvanceOrderItemRow,
   AdvanceOrderStatus,
   AdvanceOrderWithRelations,
+  Service,
 } from './types';
 
 // Utility to generate a unique ID
@@ -694,5 +695,41 @@ export const dbStore = {
     `;
 
     return { orderId };
+  },
+
+  // SERVICES
+  async listServices(): Promise<Service[]> {
+    const rows = await sql`SELECT * FROM services ORDER BY name ASC`;
+    return rows as Service[];
+  },
+
+  async addService(input: { name: string; price: number }): Promise<Service> {
+    const id = uid();
+    const rows = await sql`
+      INSERT INTO services (id, name, price)
+      VALUES (${id}, ${input.name}, ${input.price})
+      RETURNING *
+    `;
+    return rows[0] as Service;
+  },
+
+  async updateService(id: string, patch: Partial<Service>): Promise<Service | null> {
+    if (patch.name !== undefined && patch.price !== undefined) {
+      const rows = await sql`UPDATE services SET name = ${patch.name}, price = ${patch.price} WHERE id = ${id} RETURNING *`;
+      return rows[0] as Service;
+    }
+    if (patch.name !== undefined) {
+      const rows = await sql`UPDATE services SET name = ${patch.name} WHERE id = ${id} RETURNING *`;
+      return rows[0] as Service;
+    }
+    if (patch.price !== undefined) {
+      const rows = await sql`UPDATE services SET price = ${patch.price} WHERE id = ${id} RETURNING *`;
+      return rows[0] as Service;
+    }
+    return null;
+  },
+
+  async deleteService(id: string): Promise<void> {
+    await sql`DELETE FROM services WHERE id = ${id}`;
   },
 };

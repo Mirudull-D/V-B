@@ -72,6 +72,10 @@ import {
   createCategory,
   renameCategory,
   removeCategory,
+  fetchServices,
+  createService,
+  editService,
+  removeService,
   fetchStockMovements,
   fetchAdvanceOrders,
   createAdvanceOrder,
@@ -80,7 +84,7 @@ import {
   finalizeAdvanceOrder,
   setAdvanceOrderStatus,
 } from "@/app/pos/actions";
-import { ProductWithBatches, ProductBatch, CartItem, Expense, Category, AdvanceOrderWithRelations, AdvanceOrderStatus, StockMovement } from "@/lib/types";
+import { ProductWithBatches, ProductBatch, CartItem, Expense, Category, Service, AdvanceOrderWithRelations, AdvanceOrderStatus, StockMovement } from "@/lib/types";
 
 // Preset expense categories (users can also type a custom one)
 const EXPENSE_CATEGORIES = [
@@ -164,6 +168,8 @@ type CatalogItem = {
   arrivedAt?: string;
   batches?: ProductBatch[];
   productId?: string;
+  isService?: boolean; // true = service (name + price only, no stock)
+  serviceId?: string;
 };
 
 type OrderItem = {
@@ -411,7 +417,7 @@ export default function POSBilling() {
 
   const [activeCategory, setActiveCategory] = useState<string>("ALL");
   const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
-  const [inventoryView, setInventoryView] = useState<"products" | "stockReport">("products");
+  const [inventoryView, setInventoryView] = useState<"products" | "services" | "stockReport">("products");
   const [activeTab, setActiveTab] = useState<
     "billing" | "orders" | "analytics" | "inventory" | "alerts" | "expenses" | "advance"
   >("billing");
@@ -509,7 +515,17 @@ export default function POSBilling() {
 
   const [catalog, setCatalog] = useState<CatalogItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [services, setServices] = useState<Service[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Service management (create / edit / delete) — name + price only
+  const [serviceSearch, setServiceSearch] = useState("");
+  const [newServiceName, setNewServiceName] = useState("");
+  const [newServicePrice, setNewServicePrice] = useState("");
+  const [editingServiceId, setEditingServiceId] = useState<string | null>(null);
+  const [editServiceName, setEditServiceName] = useState("");
+  const [editServicePrice, setEditServicePrice] = useState("");
+  const [isSavingService, setIsSavingService] = useState(false);
 
   // Category management (create / rename / delete)
   const [showCategoryModal, setShowCategoryModal] = useState(false);
@@ -685,16 +701,29 @@ export default function POSBilling() {
     };
   };
 
+  // Services are billed as plain snapshot line items (no product_id, no stock).
+  // stockQuantity is left undefined so billing never treats them as out of stock
+  // or caps their quantity.
+  const serviceToCatalogItem = (s: Service): CatalogItem => ({
+    id: s.id,
+    serviceId: s.id,
+    isService: true,
+    name: s.name,
+    price: Number(s.price) || 0,
+    productId: undefined,
+  });
+
   const fetchData = async () => {
     setIsRefreshing(true);
     try {
-      const [productsData, ordersData, expensesData, categoriesData, advanceData, stockMovementsData] = await Promise.all([
+      const [productsData, ordersData, expensesData, categoriesData, advanceData, stockMovementsData, servicesData] = await Promise.all([
         fetchProducts(),
         fetchOrders(),
         fetchExpenses(),
         fetchCategories(),
         fetchAdvanceOrders(),
         fetchStockMovements(),
+        fetchServices(),
       ]);
       setAdvanceOrders(
         advanceData.map((a) => ({
@@ -711,6 +740,9 @@ export default function POSBilling() {
       );
       setCatalog(productsData.map(productToCatalogItem));
       setCategories(categoriesData);
+      setServices(
+        servicesData.map((s) => ({ ...s, price: Number(s.price) || 0 })),
+      );
       setStockMovements(stockMovementsData);
       setExpenses(
         expensesData.map((e) => ({ ...e, amount: Number(e.amount) || 0 })),
@@ -1758,6 +1790,86 @@ export default function POSBilling() {
     }
   };
 
+  // ── Service Management (name + price only) ───────────────────────────
+  const refreshServices = async () => {
+    try {
+      const data = await fetchServices();
+      setServices(data.map((s) => ({ ...s, price: Number(s.price) || 0 })));
+    } catch (error) {
+      console.error("Failed to refresh services:", error);
+    }
+  };
+
+  const handleAddService = async () => {
+    const name = newServiceName.trim();
+    const price = parseFloat(newServicePrice);
+    if (!name) {
+      alert("Service name cannot be empty.");
+      return;
+    }
+    if (isNaN(price) || price < 0) {
+      alert("Enter a valid price.");
+      return;
+    }
+    setIsSavingService(true);
+    try {
+      await createService({ name, price });
+      setNewServiceName("");
+      setNewServicePrice("");
+      await refreshServices();
+    } catch (err) {
+      alert("Failed to add service. The name might already exist.");
+    } finally {
+      setIsSavingService(false);
+    }
+  };
+
+  const startEditService = (s: Service) => {
+    setEditingServiceId(s.id);
+    setEditServiceName(s.name);
+    setEditServicePrice(String(s.price));
+  };
+
+  const cancelEditService = () => {
+    setEditingServiceId(null);
+    setEditServiceName("");
+    setEditServicePrice("");
+  };
+
+  const handleSaveEditService = async () => {
+    if (!editingServiceId) return;
+    const name = editServiceName.trim();
+    const price = parseFloat(editServicePrice);
+    if (!name) {
+      alert("Service name cannot be empty.");
+      return;
+    }
+    if (isNaN(price) || price < 0) {
+      alert("Enter a valid price.");
+      return;
+    }
+    setIsSavingService(true);
+    try {
+      await editService(editingServiceId, { name, price });
+      cancelEditService();
+      await refreshServices();
+    } catch (err) {
+      alert("Failed to update service. The name might already exist.");
+    } finally {
+      setIsSavingService(false);
+    }
+  };
+
+  const handleDeleteService = async (id: string) => {
+    if (!window.confirm("Delete this service? This cannot be undone.")) return;
+    try {
+      await removeService(id);
+      await refreshServices();
+    } catch (err) {
+      alert("Failed to delete service.");
+    }
+  };
+
 
   // ── Expense tracker: handlers ──────────────────────────────────────
   const printAdvanceReceipt = (adv: {id: string; autoPrint: boolean}) => {
@@ -2323,6 +2435,12 @@ export default function POSBilling() {
 
   // Inventory-derived data: low stock alerts
   const inventoryProducts = catalog.filter((c) => !c.id.startsWith("default-"));
+
+  // Combined pick-list for the billing counter: products + services. Services
+  // are appended so staff can add them to a bill; they carry no stock and bill
+  // as plain snapshot line items. Kept separate from `catalog` (products only)
+  // so the inventory table, stock caps and GST suggestion stay product-scoped.
+  const billingCatalog = [...catalog, ...services.map(serviceToCatalogItem)];
 
   const lowStockItems = inventoryProducts.filter((c) => {
     const threshold =
@@ -3958,9 +4076,10 @@ export default function POSBilling() {
                                   </div>
                                   <div className="max-h-48 overflow-y-auto">
                                     {(() => {
-                                      const list = catalog.filter(
+                                      const list = billingCatalog.filter(
                                         (c) =>
                                           (activeCategory === "ALL" ||
+                                            c.isService ||
                                             (c.category || "General") ===
                                               activeCategory) &&
                                           c.name
@@ -3972,6 +4091,7 @@ export default function POSBilling() {
                                       return list.length > 0 ? (
                                         list.map((catItem) => {
                                           const isOutOfStock =
+                                            !catItem.isService &&
                                             catItem.stockQuantity === 0;
                                           return (
                                             <div
@@ -4001,8 +4121,10 @@ export default function POSBilling() {
                                                   updateItem(
                                                     item.id,
                                                     "product_id",
-                                                    catItem.productId ||
-                                                      catItem.id,
+                                                    catItem.isService
+                                                      ? null
+                                                      : catItem.productId ||
+                                                          catItem.id,
                                                   );
                                                   updateItem(
                                                     item.id,
@@ -4026,11 +4148,13 @@ export default function POSBilling() {
                                                     {catItem.name}
                                                   </span>
                                                   <span
-                                                    className={`text-[10px] font-bold ${isOutOfStock ? "text-[#27272A]" : "text-green-600"}`}
+                                                    className={`text-[10px] font-bold ${catItem.isService ? "text-[#14243D]" : isOutOfStock ? "text-[#27272A]" : "text-green-600"}`}
                                                   >
-                                                    {isOutOfStock
-                                                      ? "Out of Stock"
-                                                      : `Stock: ${catItem.stockQuantity}`}
+                                                    {catItem.isService
+                                                      ? "Service"
+                                                      : isOutOfStock
+                                                        ? "Out of Stock"
+                                                        : `Stock: ${catItem.stockQuantity}`}
                                                   </span>
                                                 </div>
                                                 {catItem.desc && (
@@ -4045,6 +4169,7 @@ export default function POSBilling() {
                                                   </span>
                                                 )}
                                               </button>
+                                              {!catItem.isService && (
                                               <div className="flex shrink-0">
                                                 <button
                                                   onClick={(e) => {
@@ -4079,6 +4204,7 @@ export default function POSBilling() {
                                                   <Trash2 className="w-4 h-4" />
                                                 </button>
                                               </div>
+                                              )}
                                             </div>
                                           );
                                         })
@@ -4683,7 +4809,32 @@ export default function POSBilling() {
                   </div>
                 )}
 
-
+                <div className="flex flex-col sm:flex-row items-center gap-2 mt-4 pt-4 border-t border-black/10">
+                  <button
+                    onClick={() => handleOpenPrintModal(selectedAdvance.id, "advance")}
+                    className="flex-1 w-full py-2.5 bg-white border border-black/20 hover:bg-black/5 text-black rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <Printer className="w-4 h-4 text-[#14243D]" /> Print Receipt
+                  </button>
+                  <button
+                    onClick={() => shareAdvanceReceiptWhatsApp({
+                      id: selectedAdvance.id,
+                      customerName: selectedAdvance.customer_name || "Guest",
+                      customerPhone: selectedAdvance.customer_phone,
+                      total: selectedAdvance.total_amount,
+                      deposit: selectedAdvance.deposit_amount,
+                      balance: balanceRemaining(selectedAdvance),
+                      items: selectedAdvance.items.map((i) => ({
+                        name: i.snapshot_name,
+                        qty: i.quantity,
+                        price: Number(i.snapshot_price)
+                      }))
+                    })}
+                    className="flex-1 w-full py-2.5 bg-[#25D366] hover:bg-[#22C35E] text-white rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <MessageCircle className="w-4 h-4" /> WhatsApp
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -7360,6 +7511,14 @@ export default function POSBilling() {
                   Products
                 </button>
                 <button
+                  onClick={() => setInventoryView("services")}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
+                    inventoryView === "services" ? "bg-white text-[#14243D] shadow-sm" : "text-black/60 hover:text-black"
+                  }`}
+                >
+                  Services
+                </button>
+                <button
                   onClick={() => setInventoryView("stockReport")}
                   className={`px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
                     inventoryView === "stockReport" ? "bg-white text-[#14243D] shadow-sm" : "text-black/60 hover:text-black"
@@ -7892,6 +8051,167 @@ export default function POSBilling() {
                 </div>
               </div>
             )}
+
+            {inventoryView === "services" && (
+              <>
+                <div className="flex flex-wrap items-center gap-2 mb-4 w-full">
+                  <div className="relative flex-1 min-w-[180px]">
+                    <Search className="w-3.5 h-3.5 text-[#000000]/40 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      placeholder="Search services…"
+                      className="pl-9 pr-3 py-2 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D] w-full"
+                      value={serviceSearch}
+                      onChange={(e) => setServiceSearch(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                {/* Add service */}
+                <div className="bg-white border border-black/10 rounded-xl p-4 mb-4 flex flex-col sm:flex-row gap-2 sm:items-end">
+                  <div className="flex-1">
+                    <label className="text-[10px] font-black text-[#000000] uppercase tracking-wider">Service Name</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Bike Service, Consultation…"
+                      className="mt-1 w-full px-3 py-2 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D]"
+                      value={newServiceName}
+                      onChange={(e) => setNewServiceName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleAddService(); }}
+                    />
+                  </div>
+                  <div className="w-full sm:w-40">
+                    <label className="text-[10px] font-black text-[#000000] uppercase tracking-wider">Price (₹)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="0.00"
+                      className="mt-1 w-full px-3 py-2 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D]"
+                      value={newServicePrice}
+                      onChange={(e) => setNewServicePrice(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleAddService(); }}
+                    />
+                  </div>
+                  <button
+                    onClick={handleAddService}
+                    disabled={isSavingService}
+                    className="bg-[#14243D] text-white px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wider cursor-pointer hover:bg-black disabled:opacity-50 flex items-center justify-center gap-1.5"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Add Service
+                  </button>
+                </div>
+
+                {(() => {
+                  const filteredServices = services.filter((s) =>
+                    s.name.toLowerCase().includes(serviceSearch.toLowerCase()),
+                  );
+                  return services.length === 0 ? (
+                    <div className="bg-white border border-black/10 rounded-xl p-12 text-center">
+                      <div className="w-14 h-14 rounded-full bg-[#14243D]/10 flex items-center justify-center mx-auto mb-4">
+                        <Boxes className="w-7 h-7 text-[#14243D]" />
+                      </div>
+                      <p className="text-base font-bold text-[#000000]">No services yet.</p>
+                      <p className="text-xs font-semibold text-[#000000]/60 mt-1">
+                        Add a service above — it becomes billable at the counter right away.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="bg-white border border-black/10 rounded-xl overflow-hidden">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse min-w-[480px]">
+                          <thead className="bg-[#FAFAFA] border-b border-black/10 select-none">
+                            <tr>
+                              <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider">Service</th>
+                              <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-right">Price</th>
+                              <th className="p-3 text-[10px] font-black text-[#000000] uppercase tracking-wider text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {filteredServices.map((s) => (
+                              <tr key={s.id} className="border-b border-black/5 last:border-0 hover:bg-black/5 transition-colors">
+                                {editingServiceId === s.id ? (
+                                  <>
+                                    <td className="p-3">
+                                      <input
+                                        type="text"
+                                        className="w-full px-2 py-1.5 bg-white border border-black/10 rounded-lg text-xs font-semibold focus:outline-none focus:border-[#14243D]"
+                                        value={editServiceName}
+                                        onChange={(e) => setEditServiceName(e.target.value)}
+                                        onKeyDown={(e) => { if (e.key === "Enter") handleSaveEditService(); if (e.key === "Escape") cancelEditService(); }}
+                                        autoFocus
+                                      />
+                                    </td>
+                                    <td className="p-3">
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        step="0.01"
+                                        className="w-full px-2 py-1.5 bg-white border border-black/10 rounded-lg text-xs font-semibold text-right focus:outline-none focus:border-[#14243D]"
+                                        value={editServicePrice}
+                                        onChange={(e) => setEditServicePrice(e.target.value)}
+                                        onKeyDown={(e) => { if (e.key === "Enter") handleSaveEditService(); if (e.key === "Escape") cancelEditService(); }}
+                                      />
+                                    </td>
+                                    <td className="p-3">
+                                      <div className="flex items-center justify-end gap-1.5">
+                                        <button
+                                          onClick={handleSaveEditService}
+                                          disabled={isSavingService}
+                                          className="text-[10px] font-bold text-white bg-[#14243D] hover:bg-black px-3 py-1.5 rounded-lg uppercase tracking-wider cursor-pointer disabled:opacity-50"
+                                        >
+                                          Save
+                                        </button>
+                                        <button
+                                          onClick={cancelEditService}
+                                          className="text-[10px] font-bold text-[#000000] bg-white border border-black/10 hover:bg-black/5 px-3 py-1.5 rounded-lg uppercase tracking-wider cursor-pointer"
+                                        >
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </>
+                                ) : (
+                                  <>
+                                    <td className="p-3 text-xs font-bold text-[#14243D]">{s.name}</td>
+                                    <td className="p-3 text-xs font-black text-[#000000] text-right">₹{s.price.toLocaleString()}</td>
+                                    <td className="p-3">
+                                      <div className="flex items-center justify-end gap-1">
+                                        <button
+                                          onClick={() => startEditService(s)}
+                                          className="px-2.5 py-2 text-[#000000] hover:text-[#14243D] transition-colors cursor-pointer"
+                                          title="Edit service"
+                                        >
+                                          <Pencil className="w-4 h-4" />
+                                        </button>
+                                        <button
+                                          onClick={() => handleDeleteService(s.id)}
+                                          className="px-2.5 py-2 text-[#000000] hover:text-[#DC2626] transition-colors cursor-pointer"
+                                          title="Delete service"
+                                        >
+                                          <Trash2 className="w-4 h-4" />
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </>
+                                )}
+                              </tr>
+                            ))}
+                            {filteredServices.length === 0 && (
+                              <tr>
+                                <td colSpan={3} className="p-8 text-center text-xs font-semibold text-[#000000]/60">
+                                  No services match &quot;{serviceSearch}&quot;.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
+            )}
           </div>
         )}
 
@@ -8049,6 +8369,21 @@ export default function POSBilling() {
                     <span className="text-[#14243D] font-black">
                       ₹{selectedOrder.grandTotal.toLocaleString()}
                     </span>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-center gap-2 mt-6 pt-4 border-t border-black/10">
+                    <button
+                      onClick={() => handleOpenPrintModal(selectedOrder.id, "invoice")}
+                      className="flex-1 w-full py-2.5 bg-white border border-black/20 hover:bg-black/5 text-black rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                    >
+                      <Printer className="w-4 h-4 text-[#14243D]" /> Print Invoice
+                    </button>
+                    <button
+                      onClick={() => resendWhatsApp(selectedOrder)}
+                      className="flex-1 w-full py-2.5 bg-[#25D366] hover:bg-[#22C35E] text-white rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2 transition-colors cursor-pointer"
+                    >
+                      <MessageCircle className="w-4 h-4" /> WhatsApp
+                    </button>
                   </div>
                 </div>
               </div>

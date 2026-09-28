@@ -4,6 +4,13 @@ export type Category = {
   created_at: string;
 };
 
+export type Service = {
+  id: string;
+  name: string;
+  price: number;
+  created_at: string;
+};
+
 export type Product = {
   id: string;
   name: string;
