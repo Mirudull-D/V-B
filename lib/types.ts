@@ -74,17 +74,18 @@ export type PaymentMode = 'CASH' | 'GPAY' | 'SPLIT';
 export type OrderRow = {
   id: string;
   customer_id: string;
+  customer_name_snapshot?: string | null; // name at billing time (immune to later renames)
   source: 'ONLINE' | 'OFFLINE';
   status: 'COMPLETED' | 'PENDING';
   is_gst: boolean; // true = GST invoice, false = non-GST bill
-  subtotal: number; // GST-inclusive (line price × qty)
+  subtotal: number; // GST-exclusive (line price × qty)
   discount_type: 'PERCENT' | 'FIXED';
   discount_value: number;
   discount_amount: number;
   gst_percentage: number;
-  gst_amount: number; // GST inside subtotal-discount (derived)
+  gst_amount: number; // GST charged on (subtotal - discount), added on top
   delivery_fee: number;
-  grand_total: number; // = subtotal - discount + delivery
+  grand_total: number; // = subtotal - discount + gst_amount + delivery (orders before the exclusive-GST switch: GST was inside, no "+ gst_amount")
   cash_received: number; // total amount tendered (cash for CASH, gpay amount for GPAY, cash+gpay for SPLIT)
   split_cash: number; // cash portion when payment_mode = SPLIT
   split_gpay: number; // gpay portion when payment_mode = SPLIT
@@ -127,9 +128,17 @@ export type AdvanceOrderStatus = 'PENDING' | 'READY' | 'COMPLETED' | 'CANCELLED'
 export type AdvanceOrderRow = {
   id: string;
   customer_id: string;
+  customer_name_snapshot?: string | null; // name at booking time (immune to later renames)
   status: AdvanceOrderStatus;
-  subtotal: number;
-  total_amount: number;
+  subtotal: number; // GST-exclusive (line price × qty)
+  discount_type: 'PERCENT' | 'FIXED';
+  discount_value: number;
+  discount_amount: number;
+  is_gst: boolean;
+  gst_percentage: number;
+  gst_amount: number; // GST added on (subtotal - discount)
+  delivery_fee: number;
+  total_amount: number; // = subtotal - discount + gst + delivery
   deposit_amount: number;
   deposit_payment_mode: PaymentMode;
   delivery_date: string | null;

@@ -1,7 +1,9 @@
 import { dbStore } from "@/lib/dbStore";
 import { ArrowLeft, FileText } from "lucide-react";
 import Link from "next/link";
+import { ThermalPageSize } from "@/app/components/ThermalPageSize";
 import { AdvanceReceiptActions } from "./AdvanceReceiptActions";
+import { resolveAdvanceTotals, splitGst } from "@/lib/gst";
 
 export default async function AdvanceReceiptPage({
   params,
@@ -41,9 +43,17 @@ export default async function AdvanceReceiptPage({
     );
   }
 
-  const totalNum = Number(advance.total_amount) || 0;
-  const depositNum = Number(advance.deposit_amount) || 0;
-  const balanceNum = Math.max(0, totalNum - depositNum);
+  const {
+    total: totalNum,
+    deposit: depositNum,
+    balance: balanceNum,
+    subtotal: subtotalNum,
+    discountAmount: discountNum,
+    gstAmount: gstNum,
+    gstPercentage: gstPct,
+    deliveryFee: deliveryNum,
+  } = resolveAdvanceTotals(advance);
+  const { cgst: cgstNum, sgst: sgstNum } = splitGst(gstNum);
   const depositLabel =
     advance.deposit_payment_mode === "GPAY" ? "GPay" : "Cash";
 
@@ -72,13 +82,11 @@ export default async function AdvanceReceiptPage({
   if (paper === "thermal") {
     const widthClass = size === "58" ? "max-w-[260px]" : "max-w-[320px]";
     return (
-      <div className="min-h-screen bg-zinc-100/70 text-black font-mono flex flex-col items-center py-4 print:bg-white print:p-0 print:m-0">
+      <div className="min-h-screen print:min-h-0 bg-zinc-100/70 text-black font-mono flex flex-col items-center py-4 print:bg-white print:p-0 print:m-0">
+        {/* The @page size is measured from the real receipt height (see ThermalPageSize). */}
+        <ThermalPageSize widthMm={size === "58" ? 58 : 80} />
         <style>{`
           @media print {
-            @page {
-              size: ${size}mm auto;
-              margin: 3mm;
-            }
             html, body {
               background: #ffffff !important;
               color: #000000 !important;
@@ -95,7 +103,7 @@ export default async function AdvanceReceiptPage({
         {autoPrint && (
           <script dangerouslySetInnerHTML={{ __html: `setTimeout(() => window.print(), 500);` }} />
         )}
-        <div className={`w-full ${widthClass} bg-white p-3 text-[10px] leading-tight shadow-sm print:shadow-none`}>
+        <div id="thermal-receipt" className={`w-full ${widthClass} bg-white p-3 text-[10px] leading-tight shadow-sm print:shadow-none`}>
           <div className="text-center font-bold text-sm mb-1 border-b border-dashed border-black/30 pb-2">
             VIJAYA LAKSHMI INDUSTRIES<br/>
             <span className="text-[10px] font-normal">Pure Camphor & Puja Products</span>
@@ -131,8 +139,32 @@ export default async function AdvanceReceiptPage({
           <div className="border-t border-dashed border-black/30 pt-2 space-y-1">
             <div className="flex justify-between">
               <span>Subtotal:</span>
-              <span>₹{Number(advance.subtotal).toFixed(2)}</span>
+              <span>₹{subtotalNum.toFixed(2)}</span>
             </div>
+            {discountNum > 0 && (
+              <div className="flex justify-between">
+                <span>Discount:</span>
+                <span>-₹{discountNum.toFixed(2)}</span>
+              </div>
+            )}
+            {gstNum > 0 && (
+              <>
+                <div className="flex justify-between">
+                  <span>CGST ({(gstPct / 2).toFixed(1)}%):</span>
+                  <span>₹{cgstNum.toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>SGST ({(gstPct / 2).toFixed(1)}%):</span>
+                  <span>₹{sgstNum.toFixed(2)}</span>
+                </div>
+              </>
+            )}
+            {deliveryNum > 0 && (
+              <div className="flex justify-between">
+                <span>Delivery:</span>
+                <span>₹{deliveryNum.toFixed(2)}</span>
+              </div>
+            )}
             <div className="flex justify-between font-bold text-xs mt-1 border-t border-dashed border-black/30 pt-1">
               <span>Total:</span>
               <span>₹{totalNum.toFixed(2)}</span>
@@ -195,6 +227,11 @@ export default async function AdvanceReceiptPage({
             total={totalNum}
             deposit={depositNum}
             balance={balanceNum}
+            subtotal={subtotalNum}
+            discount={discountNum}
+            gstAmount={gstNum}
+            gstPercentage={gstPct}
+            deliveryFee={deliveryNum}
             autoPrint={autoPrint}
           />
         </div>
@@ -330,7 +367,39 @@ export default async function AdvanceReceiptPage({
           </div>
 
           <div className="w-full sm:w-64 space-y-2 text-xs">
-            <div className="flex justify-between text-zinc-600">
+            {(discountNum > 0 || gstNum > 0 || deliveryNum > 0) && (
+              <>
+                <div className="flex justify-between text-zinc-600">
+                  <span>Subtotal</span>
+                  <span className="font-mono text-zinc-900">₹{fmt(subtotalNum)}</span>
+                </div>
+                {discountNum > 0 && (
+                  <div className="flex justify-between text-zinc-600">
+                    <span>Discount</span>
+                    <span className="font-mono text-zinc-900">− ₹{fmt(discountNum)}</span>
+                  </div>
+                )}
+                {gstNum > 0 && (
+                  <>
+                    <div className="flex justify-between text-zinc-600">
+                      <span>CGST ({(gstPct / 2).toFixed(1)}%)</span>
+                      <span className="font-mono text-zinc-900">₹{fmt(cgstNum)}</span>
+                    </div>
+                    <div className="flex justify-between text-zinc-600">
+                      <span>SGST ({(gstPct / 2).toFixed(1)}%)</span>
+                      <span className="font-mono text-zinc-900">₹{fmt(sgstNum)}</span>
+                    </div>
+                  </>
+                )}
+                {deliveryNum > 0 && (
+                  <div className="flex justify-between text-zinc-600">
+                    <span>Delivery Fee</span>
+                    <span className="font-mono text-zinc-900">₹{fmt(deliveryNum)}</span>
+                  </div>
+                )}
+              </>
+            )}
+            <div className={`flex justify-between text-zinc-600 ${discountNum > 0 || gstNum > 0 || deliveryNum > 0 ? "border-t border-dashed border-zinc-200 pt-2" : ""}`}>
               <span>Order Total</span>
               <span className="font-mono text-zinc-900">₹{fmt(totalNum)}</span>
             </div>

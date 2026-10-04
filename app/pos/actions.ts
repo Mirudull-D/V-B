@@ -185,6 +185,13 @@ export async function createAdvanceOrder(payload: {
   customerPhone: string;
   customerAddress?: string | null;
   subtotal: number;
+  discountType: 'PERCENT' | 'FIXED';
+  discountValue: number;
+  discountAmount: number;
+  isGst: boolean;
+  gstPercentage: number;
+  gstAmount: number;
+  deliveryFee: number;
   totalAmount: number;
   depositAmount: number;
   depositPaymentMode: PaymentMode;
@@ -216,14 +223,12 @@ export async function removeAdvanceOrder(id: string): Promise<void> {
 export async function finalizeAdvanceOrder(payload: {
   advanceOrderId: string;
   invoiceId: string;
-  isGst: boolean;
-  gstPercentage: number;
-  discountType: 'PERCENT' | 'FIXED';
-  discountValue: number;
-  discountAmount: number;
-  deliveryFee: number;
+  extraDiscountType: 'PERCENT' | 'FIXED';
+  extraDiscountValue: number;
   paymentMode: PaymentMode;
   billDate: string;
+  isGst?: boolean;
+  gstPercentage?: number;
 }): Promise<{ orderId: string }> {
   return await dbStore.finalizeAdvanceOrder(payload);
 }

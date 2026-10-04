@@ -1,7 +1,9 @@
 import { dbStore } from "@/lib/dbStore";
 import { ArrowLeft, FileText } from "lucide-react";
 import Link from "next/link";
+import { ThermalPageSize } from "@/app/components/ThermalPageSize";
 import { InvoiceActions } from "./InvoiceActions";
+import { isExclusiveGstOrder, splitGst } from "@/lib/gst";
 
 // Clean Indian Number-to-Words Converter
 function numberToWords(num: number): string {
@@ -133,7 +135,19 @@ export default async function InvoicePage({
     cashReceivedNum > grandTotalNum ? cashReceivedNum - grandTotalNum : 0;
 
   const halfGstRate = order.gst_percentage ? order.gst_percentage / 2 : 9;
-  const halfGstAmount = gstAmountNum > 0 ? gstAmountNum / 2 : 0;
+  const { cgst: cgstAmount, sgst: sgstAmount } = splitGst(gstAmountNum);
+
+  // Bills saved before GST became exclusive have GST inside the total; keep
+  // rendering those as "incl. GST" so old invoices still add up.
+  const gstOnTop = isExclusiveGstOrder({
+    subtotal: subtotalNum,
+    discount: discountNum,
+    gstAmount: gstAmountNum,
+    deliveryFee: deliveryFeeNum,
+    grandTotal: grandTotalNum,
+  });
+  const gstLabelSuffix = gstOnTop ? "excl. GST" : "incl. GST";
+  const taxableValue = Math.max(0, subtotalNum - discountNum);
 
   const formattedDate = new Date(order.bill_date).toLocaleDateString("en-IN", {
     day: "2-digit",
@@ -152,13 +166,11 @@ export default async function InvoicePage({
   if (paper === "thermal") {
     const widthClass = size === "58" ? "max-w-[260px]" : "max-w-[320px]";
     return (
-      <div className="min-h-screen bg-zinc-100/70 text-black font-mono flex flex-col items-center py-4 print:bg-white print:p-0 print:m-0">
+      <div className="min-h-screen print:min-h-0 bg-zinc-100/70 text-black font-mono flex flex-col items-center py-4 print:bg-white print:p-0 print:m-0">
+        {/* The @page size is measured from the real receipt height (see ThermalPageSize). */}
+        <ThermalPageSize widthMm={size === "58" ? 58 : 80} />
         <style>{`
           @media print {
-            @page {
-              size: ${size}mm auto;
-              margin: 3mm;
-            }
             html, body {
               background: #ffffff !important;
               color: #000000 !important;
@@ -175,7 +187,7 @@ export default async function InvoicePage({
         {isAutoPrint && (
           <script dangerouslySetInnerHTML={{ __html: `setTimeout(() => window.print(), 500);` }} />
         )}
-        <div className={`w-full ${widthClass} bg-white p-3 text-[10px] leading-tight shadow-sm print:shadow-none`}>
+        <div id="thermal-receipt" className={`w-full ${widthClass} bg-white p-3 text-[10px] leading-tight shadow-sm print:shadow-none`}>
           <div className="text-center font-bold text-sm mb-1 border-b border-dashed border-black/30 pb-2">
             VIJAYA LAKSHMI INDUSTRIES<br/>
             <span className="text-[10px] font-normal">Pure Camphor & Puja Products</span>
@@ -393,10 +405,10 @@ export default async function InvoicePage({
                 {order.is_gst && <th className="pb-3 text-center w-16">HSN</th>}
                 <th className="pb-3 text-center w-12">Qty</th>
                 <th className="pb-3 text-right w-24">
-                  Rate (₹){order.is_gst && <span className="block text-[8px] font-normal normal-case tracking-normal text-zinc-400">incl. GST</span>}
+                  Rate (₹){order.is_gst && <span className="block text-[8px] font-normal normal-case tracking-normal text-zinc-400">{gstLabelSuffix}</span>}
                 </th>
                 <th className="pb-3 text-right w-28">
-                  Amount (₹){order.is_gst && <span className="block text-[8px] font-normal normal-case tracking-normal text-zinc-400">incl. GST</span>}
+                  Amount (₹){order.is_gst && <span className="block text-[8px] font-normal normal-case tracking-normal text-zinc-400">{gstLabelSuffix}</span>}
                 </th>
               </tr>
             </thead>
@@ -473,13 +485,6 @@ export default async function InvoicePage({
                 )}
               </div>
             )}
-
-            {/* Simple Terms */}
-            <div className="text-[11px] text-zinc-500 leading-relaxed pt-2">
-              <p className="font-medium text-zinc-700 mb-0.5">Terms & Notes:</p>
-              <p>• Goods once sold can only be exchanged within 7 days with this invoice.</p>
-              <p>• Manufacturer warranty applies to eligible products where available.</p>
-            </div>
           </div>
 
           {/* Right Side: Financial Breakdown */}
@@ -487,9 +492,9 @@ export default async function InvoicePage({
             <div className="flex justify-between text-zinc-600">
               <span>
                 Subtotal
-                {order.is_gst && (
+                {order.is_gst && gstAmountNum > 0 && (
                   <span className="text-[9px] font-semibold text-zinc-400 uppercase ml-1">
-                    incl. GST
+                    {gstLabelSuffix}
                   </span>
                 )}
               </span>
@@ -511,19 +516,27 @@ export default async function InvoicePage({
 
             {order.is_gst && gstAmountNum > 0 && (
               <>
+                {gstOnTop && discountNum > 0 && (
+                  <div className="flex justify-between text-zinc-600">
+                    <span>Taxable Value</span>
+                    <span className="font-mono text-zinc-900">
+                      ₹{taxableValue.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                )}
                 <div className="pt-1 mt-1 border-t border-dashed border-zinc-200 text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">
-                  GST (included above)
+                  {gstOnTop ? "GST (added)" : "GST (included above)"}
                 </div>
                 <div className="flex justify-between text-zinc-600">
                   <span>CGST ({halfGstRate.toFixed(1)}%)</span>
                   <span className="font-mono text-zinc-800">
-                    ₹{halfGstAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    ₹{cgstAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
                 <div className="flex justify-between text-zinc-600">
                   <span>SGST ({halfGstRate.toFixed(1)}%)</span>
                   <span className="font-mono text-zinc-800">
-                    ₹{halfGstAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    ₹{sgstAmount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                 </div>
               </>

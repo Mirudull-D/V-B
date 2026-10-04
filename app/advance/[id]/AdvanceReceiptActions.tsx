@@ -11,6 +11,11 @@ interface AdvanceReceiptActionsProps {
   total: number;
   deposit: number;
   balance: number;
+  subtotal?: number;
+  discount?: number;
+  gstAmount?: number;
+  gstPercentage?: number;
+  deliveryFee?: number;
   autoPrint?: boolean;
 }
 
@@ -21,6 +26,11 @@ export function AdvanceReceiptActions({
   total,
   deposit,
   balance,
+  subtotal,
+  discount,
+  gstAmount,
+  gstPercentage,
+  deliveryFee,
   autoPrint,
 }: AdvanceReceiptActionsProps) {
   useEffect(() => {
@@ -43,6 +53,12 @@ export function AdvanceReceiptActions({
     const text =
       `*VIJAYA LAKSHMI*\nAdvance Order Receipt #${advanceId}\n` +
       `Customer: ${customerName || "Counter Customer"}\n\n` +
+      (discount || gstAmount || deliveryFee
+        ? `Subtotal: ₹${fmt(subtotal ?? 0)}\n` +
+          (discount ? `Discount: -₹${fmt(discount)}\n` : "") +
+          (gstAmount ? `GST${gstPercentage ? ` (${gstPercentage}%)` : ""}: ₹${fmt(gstAmount)}\n` : "") +
+          (deliveryFee ? `Delivery: ₹${fmt(deliveryFee)}\n` : "")
+        : "") +
       `Order Total: ₹${fmt(total)}\n` +
       `Deposit Paid: ₹${fmt(deposit)}\n` +
       `Balance Due: ₹${fmt(balance)}\n\n` +

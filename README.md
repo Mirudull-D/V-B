@@ -39,6 +39,8 @@ A PWA-enabled Point of Sale (POS), billing, and inventory management system for 
 
 ### 📊 Analytics — GST & Non-GST Dashboards (Admin only)
 - Switch the whole dashboard between **All Bills / GST Invoices / Non-GST Bills**
+- GST is **exclusive**: product prices are pre-tax and GST is added on top of (subtotal − discount); delivery is not taxed
+- Revenue / net earnings are shown **excl. GST**; GST collected is reported separately
 - KPIs: total revenue, completed bills, online/offline split, items sold, avg order value
 - Today's Sales, monthly & weekly revenue trends
 - Product sales leaderboard with market share

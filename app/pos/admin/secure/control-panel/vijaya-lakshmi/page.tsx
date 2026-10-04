@@ -67,6 +67,7 @@ import {
   editBatch,
   fetchExpenses,
   createExpense,
+  editExpense,
   removeExpense,
   fetchCategories,
   createCategory,
@@ -85,6 +86,8 @@ import {
   setAdvanceOrderStatus,
 } from "@/app/pos/actions";
 import { ProductWithBatches, ProductBatch, CartItem, Expense, Category, Service, AdvanceOrderWithRelations, AdvanceOrderStatus, StockMovement } from "@/lib/types";
+import { calcExclusiveGst, computeAdvanceFinalization, netSales, isExclusiveGstOrder, resolveAdvanceTotals } from "@/lib/gst";
+import { localDateStr } from "@/lib/dates";
 
 // Preset expense categories (users can also type a custom one)
 const EXPENSE_CATEGORIES = [
@@ -99,6 +102,9 @@ const EXPENSE_CATEGORIES = [
   "Taxes & Fees",
   "Miscellaneous",
 ] as const;
+
+// Cashier-managed list of expense categories, kept in this browser.
+const EXPENSE_CATEGORIES_KEY = "expense_categories";
 
 const EXPENSE_PAYMENT_MODES = ["CASH", "UPI", "CARD", "BANK", "OTHER"] as const;
 
@@ -425,9 +431,9 @@ export default function POSBilling() {
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [customerAddress, setCustomerAddress] = useState("");
-  const [customOrderDate, setCustomOrderDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
-  );
+  // "" = bill at the current moment. Only set when a PAST date is picked, so a
+  // stale picker value can never silently back-date a later bill.
+  const [customOrderDate, setCustomOrderDate] = useState<string>("");
   const [items, setItems] = useState<OrderItem[]>([
     { id: "1", name: "", desc: "", price: 0, qty: 1 },
   ]);
@@ -447,6 +453,8 @@ export default function POSBilling() {
   const [receiveDiscountType, setReceiveDiscountType] = useState<"FIXED" | "PERCENT">("FIXED");
   const [receiveDiscountValue, setReceiveDiscountValue] = useState<number | "">("");
   const [receivePaymentMode, setReceivePaymentMode] = useState<OrderPaymentMode>("CASH");
+  // Invoice type for the final bill. Pre-filled from what was chosen when the
+  // advance was booked; the cashier can still switch it here.
   const [receiveIsGst, setReceiveIsGst] = useState(false);
   const [receiveGstPct, setReceiveGstPct] = useState<number>(18);
   const [isFinalizing, setIsFinalizing] = useState(false);
@@ -457,10 +465,10 @@ export default function POSBilling() {
     "all" | "today" | "week" | "month" | "year" | "custom"
   >("all");
   const [advStartDate, setAdvStartDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [advEndDate, setAdvEndDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [discountValue, setDiscountValue] = useState<number>(0);
   const [discountType, setDiscountType] = useState<"fixed" | "percent">(
@@ -517,6 +525,18 @@ export default function POSBilling() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [services, setServices] = useState<Service[]>([]);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  // Local "today" (YYYY-MM-DD), re-checked every minute so "Today" figures roll
+  // over at midnight even if the page is left open.
+  const [todayKey, setTodayKey] = useState<string>(() => localDateStr());
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setTodayKey((prev) => {
+        const next = localDateStr();
+        return next === prev ? prev : next;
+      });
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Service management (create / edit / delete) — name + price only
   const [serviceSearch, setServiceSearch] = useState("");
@@ -542,6 +562,11 @@ export default function POSBilling() {
     total: number;
     deposit: number;
     balance: number;
+    subtotal?: number;
+    discount?: number;
+    gstAmount?: number;
+    gstPercentage?: number;
+    deliveryFee?: number;
     items: { name: string; qty: number; price: number }[];
   } | null>(null);
 
@@ -555,10 +580,10 @@ export default function POSBilling() {
     "all" | "today" | "week" | "month" | "year" | "custom"
   >("all");
   const [analyticsStartDate, setAnalyticsStartDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [analyticsEndDate, setAnalyticsEndDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [analyticsSubTab, setAnalyticsSubTab] = useState<
     "revenue" | "today" | "products" | "coupons"
@@ -574,23 +599,29 @@ export default function POSBilling() {
   // Expense tracker state
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [expTitle, setExpTitle] = useState("");
+  const [expenseCategories, setExpenseCategories] = useState<string[]>([
+    ...EXPENSE_CATEGORIES,
+  ]);
+  const [showExpCatModal, setShowExpCatModal] = useState(false);
+  const [newExpCatName, setNewExpCatName] = useState("");
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null);
   const [expCategory, setExpCategory] = useState<string>(EXPENSE_CATEGORIES[0]);
   const [expCustomCategory, setExpCustomCategory] = useState("");
   const [expAmount, setExpAmount] = useState<number | "">("");
   const [expPaymentMode, setExpPaymentMode] = useState<string>("CASH");
   const [expNotes, setExpNotes] = useState("");
   const [expDate, setExpDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [isSavingExpense, setIsSavingExpense] = useState(false);
   const [expensePeriod, setExpensePeriod] = useState<
     "all" | "today" | "week" | "month" | "year" | "custom"
   >("month");
   const [expenseStartDate, setExpenseStartDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [expenseEndDate, setExpenseEndDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [expenseCategoryFilter, setExpenseCategoryFilter] = useState<string>("ALL");
   const [expenseSearch, setExpenseSearch] = useState("");
@@ -729,6 +760,10 @@ export default function POSBilling() {
         advanceData.map((a) => ({
           ...a,
           subtotal: Number(a.subtotal) || 0,
+          discount_amount: Number(a.discount_amount) || 0,
+          gst_amount: Number(a.gst_amount) || 0,
+          gst_percentage: Number(a.gst_percentage) || 0,
+          delivery_fee: Number(a.delivery_fee) || 0,
           total_amount: Number(a.total_amount) || 0,
           deposit_amount: Number(a.deposit_amount) || 0,
           items: a.items.map((i) => ({
@@ -854,10 +889,10 @@ export default function POSBilling() {
     "all" | "today" | "week" | "month" | "year" | "custom"
   >("all");
   const [historyStartDate, setHistoryStartDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
   const [historyEndDate, setHistoryEndDate] = useState<string>(
-    new Date().toISOString().split("T")[0],
+    localDateStr(),
   );
 
   const [selectedCoupon, setSelectedCoupon] = useState<string>("none");
@@ -1196,19 +1231,16 @@ export default function POSBilling() {
     setCatalog((prev) => prev.filter((c) => c.id !== id));
   };
 
-  // Product prices are GST-inclusive. Subtotal already contains GST; we back-derive
-  // the GST portion for display and never add it on top of the grand total.
+  // Product prices are GST-exclusive. GST is charged on (subtotal - discount)
+  // and added on top; delivery is not taxed.
   const subtotal = items.reduce((acc, item) => acc + item.price * item.qty, 0);
   const calculatedDiscount =
     discountType === "percent"
       ? subtotal * (discountValue / 100)
       : discountValue;
-  const netInclusive = Math.max(0, subtotal - calculatedDiscount);
-  const gstAmount =
-    applyGST && gstPercentage > 0
-      ? netInclusive - netInclusive / (1 + gstPercentage / 100)
-      : 0;
-  const grandTotal = netInclusive + deliveryFee;
+  const taxableAmount = Math.max(0, subtotal - calculatedDiscount);
+  const gstAmount = applyGST ? calcExclusiveGst(taxableAmount, gstPercentage) : 0;
+  const grandTotal = taxableAmount + gstAmount + deliveryFee;
 
   // Suggest a GST % from the products currently in the cart (their per-product
   // default rate). Used to pre-fill the changeable GST field when a GST invoice
@@ -1290,6 +1322,13 @@ export default function POSBilling() {
         customerPhone,
         customerAddress: customerAddress || null,
         subtotal,
+        discountType: discountType === "percent" ? "PERCENT" : "FIXED",
+        discountValue,
+        discountAmount: calculatedDiscount,
+        isGst: applyGST,
+        gstPercentage: applyGST ? gstPercentage : 0,
+        gstAmount,
+        deliveryFee,
         totalAmount: grandTotal,
         depositAmount: deposit,
         depositPaymentMode: advDepositPaymentMode,
@@ -1311,6 +1350,11 @@ export default function POSBilling() {
         total: grandTotal,
         deposit,
         balance: grandTotal - deposit,
+        subtotal,
+        discount: calculatedDiscount,
+        gstAmount,
+        gstPercentage: applyGST ? gstPercentage : 0,
+        deliveryFee,
         items: items.map((i) => ({ name: i.name, qty: i.qty, price: i.price })),
       });
 
@@ -1322,8 +1366,10 @@ export default function POSBilling() {
       setDiscountValue(0);
       setDeliveryFee(0);
       setCashReceived(0);
+      setApplyGST(false);
+      setGstPercentage(18);
       setShowAdvanceSaveModal(false);
-      await fetchData();
+      void fetchData();
     } catch (err) {
       console.error("Failed to save advance order:", err);
       alert("Could not save the advance order. Please try again.");
@@ -1338,8 +1384,8 @@ export default function POSBilling() {
     setReceiveDiscountType("FIXED");
     setReceiveDiscountValue("");
     setReceivePaymentMode("CASH");
-    setReceiveIsGst(false);
-    setReceiveGstPct(18);
+    setReceiveIsGst(Boolean(adv.is_gst));
+    setReceiveGstPct(Number(adv.gst_percentage) > 0 ? Number(adv.gst_percentage) : 18);
   };
 
   const openAdvanceView = (adv: AdvanceOrderWithRelations) => {
@@ -1355,21 +1401,40 @@ export default function POSBilling() {
   const balanceRemaining = (adv: AdvanceOrderWithRelations) =>
     Math.max(0, Number(adv.total_amount) - Number(adv.deposit_amount));
 
+  // Live preview of the final invoice. `receiveBase` has no extra discount (just
+  // the booked bill under the chosen GST type); `receivePreview` adds it.
+  const receiveCalc = (extraType: "FIXED" | "PERCENT", extraValue: number) => {
+    if (!selectedAdvance) return null;
+    const t = resolveAdvanceTotals(selectedAdvance);
+    return computeAdvanceFinalization({
+      subtotal: selectedAdvance.items.reduce(
+        (acc, i) => acc + Number(i.snapshot_price) * i.quantity,
+        0,
+      ),
+      baseDiscount: t.discountAmount,
+      deliveryFee: t.deliveryFee,
+      deposit: t.deposit,
+      isGst: receiveIsGst,
+      gstPercentage: receiveGstPct,
+      extraDiscountType: extraType,
+      extraDiscountValue: extraValue,
+    });
+  };
+  const receiveBase = receiveCalc("FIXED", 0);
+  const receivePreview = receiveCalc(receiveDiscountType, Number(receiveDiscountValue) || 0);
+
+  // Raw discount the cashier typed, as an amount off the balance due.
   const receiveBalanceDiscountAmount = (() => {
-    if (!selectedAdvance) return 0;
-    const base = balanceRemaining(selectedAdvance);
+    if (!receiveBase) return 0;
     const val = Number(receiveDiscountValue) || 0;
-    return receiveDiscountType === "PERCENT" ? base * (val / 100) : val;
+    return receiveDiscountType === "PERCENT" ? receiveBase.balanceDue * (val / 100) : val;
   })();
 
-  const receiveBalanceFinalAmount = (() => {
-    if (!selectedAdvance) return 0;
-    return Math.max(0, balanceRemaining(selectedAdvance) - receiveBalanceDiscountAmount);
-  })();
+  const receiveBalanceFinalAmount = receivePreview?.balanceDue ?? 0;
 
   const confirmReceiveBalance = async () => {
     if (!selectedAdvance || isFinalizing) return;
-    if (receiveBalanceDiscountAmount > balanceRemaining(selectedAdvance)) {
+    if (receiveBalanceDiscountAmount > (receiveBase?.balanceDue ?? 0)) {
       alert("Discount cannot exceed the remaining balance.");
       return;
     }
@@ -1379,17 +1444,15 @@ export default function POSBilling() {
       await finalizeAdvanceOrder({
         advanceOrderId: selectedAdvance.id,
         invoiceId,
+        extraDiscountType: receiveDiscountType,
+        extraDiscountValue: Number(receiveDiscountValue) || 0,
+        paymentMode: receivePaymentMode,
+        billDate: localDateStr(),
         isGst: receiveIsGst,
         gstPercentage: receiveIsGst ? receiveGstPct : 0,
-        discountType: receiveDiscountType,
-        discountValue: Number(receiveDiscountValue) || 0,
-        discountAmount: receiveBalanceDiscountAmount,
-        deliveryFee: 0,
-        paymentMode: receivePaymentMode,
-        billDate: new Date().toISOString(),
       });
       closeAdvanceDialog();
-      await fetchData();
+      void fetchData();
       alert(`Payment received. Invoice ${invoiceId} created and revenue recognized.`);
     } catch (err) {
       console.error("Failed to finalize advance order:", err);
@@ -1470,13 +1533,12 @@ export default function POSBilling() {
       discountType === "percent"
         ? localSubtotal * (discountValue / 100)
         : discountValue;
-    // Prices are GST-inclusive: derive GST from subtotal instead of adding on top.
-    const localNetInclusive = Math.max(0, localSubtotal - localCalculatedDiscount);
-    const localGstAmount =
-      applyGST && gstPercentage > 0
-        ? localNetInclusive - localNetInclusive / (1 + gstPercentage / 100)
-        : 0;
-    const localGrandTotal = localNetInclusive + deliveryFee;
+    // Prices are GST-exclusive: GST is added on top of (subtotal - discount).
+    const localTaxable = Math.max(0, localSubtotal - localCalculatedDiscount);
+    const localGstAmount = applyGST
+      ? calcExclusiveGst(localTaxable, gstPercentage)
+      : 0;
+    const localGrandTotal = localTaxable + localGstAmount + deliveryFee;
 
     if (paymentMode === "SPLIT") {
       const splitTotal = splitCash + splitGpay;
@@ -1518,14 +1580,10 @@ export default function POSBilling() {
       return null;
     }
 
-    const currentTimeStr = new Date().toTimeString().split(" ")[0];
-    let orderTimestamp = new Date().toISOString();
-    if (customOrderDate) {
-      const parsedDate = new Date(`${customOrderDate}T${currentTimeStr}`);
-      if (!isNaN(parsedDate.getTime())) {
-        orderTimestamp = parsedDate.toISOString();
-      }
-    }
+    // bill_date is a DATE column: send the LOCAL calendar date. An ISO/UTC
+    // timestamp would be cut to its UTC date, i.e. "yesterday" before 5:30 AM IST.
+    // (The time of day comes from created_at.)
+    const orderTimestamp = customOrderDate || localDateStr();
 
     setIsSubmittingOrder(true);
 
@@ -1587,7 +1645,7 @@ export default function POSBilling() {
         splitCash: paymentMode === "SPLIT" ? Number(splitCash) : undefined,
         splitGpay: paymentMode === "SPLIT" ? Number(splitGpay) : undefined,
         paymentMode: paymentMode,
-        date: orderTimestamp,
+        date: `${orderTimestamp}T00:00:00`, // local midnight, same as a reloaded DATE value
         createdAt: new Date().toISOString(),
         status: "Completed",
       };
@@ -1622,7 +1680,7 @@ export default function POSBilling() {
       setCustomerName("");
       setCustomerPhone("");
       setCustomerAddress("");
-      setCustomOrderDate(new Date().toISOString().split("T")[0]);
+      setCustomOrderDate("");
       setItems([{ id: "1", name: "", desc: "", price: 0, qty: 1 }]);
       setDiscountValue(0);
       setDeliveryFee(0);
@@ -1690,18 +1748,21 @@ export default function POSBilling() {
     let message = `${shopEmoji} *VIJAYA LAKSHMI INDUSTRIES* ${shopEmoji}\n\n`;
     message += `${checkEmoji} Here are your ${order.isGst ? "GST invoice" : "bill"} details!\n\n`;
 
-    message += `Subtotal (incl. GST): ₹${order.subtotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n`;
+    const gstOnBill = Number(order.gstAmount) || 0;
+    // Bills saved before GST became exclusive carry their GST inside the subtotal.
+    const gstAddedOnTop = isExclusiveGstOrder(order);
+    const showGst = order.isGst && gstOnBill > 0.1;
+
+    message += `Subtotal${showGst && !gstAddedOnTop ? " (incl. GST)" : ""}: ₹${order.subtotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n`;
     if (order.discount > 0) {
       message += `Discount Applied: -₹${order.discount.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n`;
     }
 
-    // GST already sits inside the subtotal — surface it for the customer only.
-    const gstInsideBill = Number(order.gstAmount) || 0;
-    if (order.isGst && gstInsideBill > 0.1) {
+    if (showGst) {
       const gstLabel = order.gstPercentage
-        ? `GST (${order.gstPercentage}% incl.)`
-        : "GST (incl.)";
-      message += `${gstLabel}: ₹${gstInsideBill.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n`;
+        ? `GST (${order.gstPercentage}%${gstAddedOnTop ? "" : " incl."})`
+        : gstAddedOnTop ? "GST" : "GST (incl.)";
+      message += `${gstLabel}: ₹${gstOnBill.toLocaleString(undefined, { minimumFractionDigits: 2 })}\n`;
     }
 
     if (order.deliveryFee > 0) {
@@ -1731,8 +1792,16 @@ export default function POSBilling() {
       )
     )
       return;
-    await removeOrder(orderId);
+    try {
+      await removeOrder(orderId);
+    } catch (err) {
+      console.error("Delete order failed:", err);
+      alert("Could not delete the invoice. Please try again.");
+      return;
+    }
     setOrders((prev) => prev.filter((o) => o.id !== orderId));
+    // Deleting restores stock and may reopen the advance it came from.
+    void fetchData();
     if (selectedOrder?.id === orderId) setSelectedOrder(null);
     if (completedBillData?.id === orderId) setCompletedBillData(null);
     if (printSettingsModal?.id === orderId) setPrintSettingsModal(null);
@@ -1876,7 +1945,7 @@ export default function POSBilling() {
     handleOpenPrintModal(adv.id, "advance");
   };
 
-  const shareAdvanceReceiptWhatsApp = (adv: {id: string; customerName: string; customerPhone: string; total: number; deposit: number; balance: number; items?: { name: string; qty: number; price: number }[]}) => {
+  const shareAdvanceReceiptWhatsApp = (adv: {id: string; customerName: string; customerPhone: string; total: number; deposit: number; balance: number; subtotal?: number; discount?: number; gstAmount?: number; gstPercentage?: number; deliveryFee?: number; items?: { name: string; qty: number; price: number }[]}) => {
     if (!adv.customerPhone || adv.customerPhone.length < 10) {
       alert("Invalid customer phone number.");
       return;
@@ -1894,6 +1963,12 @@ export default function POSBilling() {
       `*VIJAYA LAKSHMI*\nAdvance Order Receipt #${adv.id}\n` +
       `Customer: ${adv.customerName || "Counter Customer"}\n` +
       itemsText +
+      (adv.discount || adv.gstAmount || adv.deliveryFee
+        ? `\nSubtotal: ₹${fmt(adv.subtotal ?? 0)}\n` +
+          (adv.discount ? `Discount: -₹${fmt(adv.discount)}\n` : "") +
+          (adv.gstAmount ? `GST${adv.gstPercentage ? ` (${adv.gstPercentage}%)` : ""}: ₹${fmt(adv.gstAmount)}\n` : "") +
+          (adv.deliveryFee ? `Delivery: ₹${fmt(adv.deliveryFee)}\n` : "")
+        : "") +
       `\nOrder Total: ₹${fmt(adv.total)}\n` +
       `Deposit Paid: ₹${fmt(adv.deposit)}\n` +
       `Balance Due: ₹${fmt(adv.balance)}\n\n` +
@@ -1902,6 +1977,96 @@ export default function POSBilling() {
     const encoded = encodeURIComponent(text);
     const url = `https://api.whatsapp.com/send?phone=91${cleanPhone}&text=${encoded}`;
     window.open(url, "_blank");
+  };
+
+  // Share payload for a saved advance order, including its discount / GST / delivery.
+  const advanceShareArgs = (a: AdvanceOrderWithRelations) => {
+    const t = resolveAdvanceTotals(a);
+    return {
+      id: a.id,
+      customerName: a.customer_name || "Guest",
+      customerPhone: a.customer_phone,
+      total: t.total,
+      deposit: t.deposit,
+      balance: t.balance,
+      subtotal: t.subtotal,
+      discount: t.discountAmount,
+      gstAmount: t.gstAmount,
+      gstPercentage: t.gstPercentage,
+      deliveryFee: t.deliveryFee,
+      items: a.items.map((i) => ({
+        name: i.snapshot_name,
+        qty: i.quantity,
+        price: Number(i.snapshot_price),
+      })),
+    };
+  };
+
+  // Load the saved category list once on the client (localStorage is not
+  // available during server render).
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(EXPENSE_CATEGORIES_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (
+        Array.isArray(parsed) &&
+        parsed.length > 0 &&
+        parsed.every((c) => typeof c === "string")
+      ) {
+        setExpenseCategories(parsed);
+        setExpCategory((cur) => (parsed.includes(cur) ? cur : parsed[0]));
+      }
+    } catch {}
+  }, []);
+
+  const saveExpenseCategories = (next: string[]) => {
+    setExpenseCategories(next);
+    try {
+      localStorage.setItem(EXPENSE_CATEGORIES_KEY, JSON.stringify(next));
+    } catch {}
+  };
+
+  const addExpenseCategory = (raw: string): string | null => {
+    const name = raw.trim();
+    if (!name) return null;
+    const existing = expenseCategories.find(
+      (c) => c.toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) return existing;
+    saveExpenseCategories([...expenseCategories, name]);
+    return name;
+  };
+
+  const removeExpenseCategory = (name: string) => {
+    if (expenseCategories.length <= 1) {
+      alert("Keep at least one category.");
+      return;
+    }
+    // Existing expenses keep their category text; only the picker list changes.
+    const next = expenseCategories.filter((c) => c !== name);
+    saveExpenseCategories(next);
+    if (expCategory === name) setExpCategory(next[0]);
+  };
+
+  const resetExpenseForm = () => {
+    setEditingExpenseId(null);
+    setExpTitle("");
+    setExpAmount("");
+    setExpNotes("");
+    setExpCustomCategory("");
+  };
+
+  const startEditExpense = (e: Expense) => {
+    setEditingExpenseId(e.id);
+    setExpTitle(e.title);
+    setExpAmount(e.amount);
+    setExpNotes(e.notes || "");
+    setExpDate(/^\d{4}-\d{2}-\d{2}$/.test(String(e.expense_date)) ? String(e.expense_date) : localDateStr(new Date(e.expense_date)));
+    setExpPaymentMode(e.payment_mode);
+    setExpCategory(e.category);
+    setExpCustomCategory("");
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const handleAddExpense = async () => {
@@ -1920,14 +2085,29 @@ export default function POSBilling() {
     }
     setIsSavingExpense(true);
     try {
-      const created = await createExpense({
+      const fields = {
         title: expTitle.trim(),
         category,
         amount: amountNum,
         payment_mode: expPaymentMode,
         notes: expNotes.trim() || null,
         expense_date: expDate,
-      });
+      };
+      if (editingExpenseId) {
+        const updated = await editExpense(editingExpenseId, fields);
+        if (updated) {
+          setExpenses((prev) =>
+            prev.map((x) =>
+              x.id === editingExpenseId
+                ? { ...updated, amount: Number(updated.amount) || 0 }
+                : x,
+            ),
+          );
+        }
+        resetExpenseForm();
+        return;
+      }
+      const created = await createExpense(fields);
       setExpenses((prev) => [
         { ...created, amount: Number(created.amount) || 0 },
         ...prev,
@@ -1937,7 +2117,8 @@ export default function POSBilling() {
       setExpAmount("");
       setExpNotes("");
       if (expCategory === "__custom__") {
-        setExpCategory(category);
+        // A newly typed category joins the saved list.
+        setExpCategory(addExpenseCategory(category) ?? category);
         setExpCustomCategory("");
       }
     } catch (err) {
@@ -1953,6 +2134,7 @@ export default function POSBilling() {
     try {
       await removeExpense(id);
       setExpenses((prev) => prev.filter((e) => e.id !== id));
+      if (editingExpenseId === id) resetExpenseForm();
     } catch (err) {
       console.error("Error deleting expense:", err);
       alert("Could not delete the expense.");
@@ -2030,6 +2212,7 @@ export default function POSBilling() {
     expenseSearch,
     expenseSortField,
     expenseSortOrder,
+    todayKey,
   ]);
 
   // Total expenses within the CURRENT analytics window (drives Net Profit on the dashboard)
@@ -2044,7 +2227,7 @@ export default function POSBilling() {
         ),
       )
       .reduce((acc, e) => acc + e.amount, 0);
-  }, [expenses, analyticsPeriod, analyticsStartDate, analyticsEndDate]);
+  }, [expenses, analyticsPeriod, analyticsStartDate, analyticsEndDate, todayKey]);
 
   // Real-time analytics derived from orders with period filtering
   const {
@@ -2055,6 +2238,8 @@ export default function POSBilling() {
     nonGstRevenue,
     gstOrdersCount,
     nonGstOrdersCount,
+    gstCollected,
+    todayGstCollected,
     avgOrderValue,
     onlineOrders,
     offlineOrders,
@@ -2147,7 +2332,7 @@ export default function POSBilling() {
 
     const totalOrdersCount = analyticsFilteredOrders.length;
     const totalRevenueAmount = analyticsFilteredOrders.reduce(
-      (acc, o) => acc + o.grandTotal,
+      (acc, o) => acc + netSales(o),
       0,
     );
     const avgOrderValue =
@@ -2155,13 +2340,19 @@ export default function POSBilling() {
 
     const gstOrders = analyticsFilteredOrders.filter((o) => o.isGst);
     const nonGstOrders = analyticsFilteredOrders.filter((o) => !o.isGst);
-    const gstRevenue = gstOrders.reduce((acc, o) => acc + o.grandTotal, 0);
+    const gstRevenue = gstOrders.reduce((acc, o) => acc + netSales(o), 0);
     const nonGstRevenue = nonGstOrders.reduce(
-      (acc, o) => acc + o.grandTotal,
+      (acc, o) => acc + netSales(o),
       0,
     );
     const gstOrdersCount = gstOrders.length;
     const nonGstOrdersCount = nonGstOrders.length;
+    // GST charged to customers — owed to the government, so it is NOT part of
+    // revenue (revenue/profit figures above are ex-GST via netSales()).
+    const gstCollected = gstOrders.reduce(
+      (acc, o) => acc + (Number(o.gstAmount) || 0),
+      0,
+    );
 
     // Split channels
     const onlineOrders = analyticsFilteredOrders.filter(
@@ -2174,10 +2365,10 @@ export default function POSBilling() {
     // Split revenues
     const onlineRevenue = analyticsFilteredOrders
       .filter((o) => o.source === "ONLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + netSales(o), 0);
     const offlineRevenue = analyticsFilteredOrders
       .filter((o) => o.source === "OFFLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + netSales(o), 0);
 
     // Top items by revenue in analyticsFilteredOrders
     const itemSales: Record<
@@ -2246,7 +2437,7 @@ export default function POSBilling() {
         orderTime <= sundayOfThisWeek.getTime()
       ) {
         const day = (orderDate.getDay() + 6) % 7;
-        weekRevenue[day] += order.grandTotal;
+        weekRevenue[day] += netSales(order);
       }
     });
     const maxWeekRevenue = Math.max(...weekRevenue, 1);
@@ -2279,7 +2470,7 @@ export default function POSBilling() {
       }
       const d = new Date(order.date);
       if (d.getFullYear() === now.getFullYear()) {
-        monthRevenue[d.getMonth()] += order.grandTotal;
+        monthRevenue[d.getMonth()] += netSales(order);
       }
     });
     const maxMonthRevenue = Math.max(...monthRevenue, 1);
@@ -2305,7 +2496,11 @@ export default function POSBilling() {
       );
     });
 
-    const todayRevenue = todayOrders.reduce((acc, o) => acc + o.grandTotal, 0);
+    const todayRevenue = todayOrders.reduce((acc, o) => acc + netSales(o), 0);
+    const todayGstCollected = todayOrders.reduce(
+      (acc, o) => acc + (o.isGst ? Number(o.gstAmount) || 0 : 0),
+      0,
+    );
 
     const todayOrdersCount = todayOrders.length;
     const todayOnlineOrdersCount = todayOrders.filter(
@@ -2317,10 +2512,10 @@ export default function POSBilling() {
 
     const todayOnlineRevenue = todayOrders
       .filter((o) => o.source === "ONLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + netSales(o), 0);
     const todayOfflineRevenue = todayOrders
       .filter((o) => o.source === "OFFLINE")
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + netSales(o), 0);
 
     const todayItemsSold = todayOrders.reduce(
       (acc, o) =>
@@ -2359,7 +2554,7 @@ export default function POSBilling() {
           d.getFullYear() === now.getFullYear()
         );
       })
-      .reduce((acc, o) => acc + o.grandTotal, 0);
+      .reduce((acc, o) => acc + netSales(o), 0);
 
     const totalItemsSold = analyticsFilteredOrders.reduce(
       (acc, o) =>
@@ -2393,6 +2588,8 @@ export default function POSBilling() {
       nonGstRevenue,
       gstOrdersCount,
       nonGstOrdersCount,
+      gstCollected,
+      todayGstCollected,
       avgOrderValue,
       onlineOrders,
       offlineOrders,
@@ -2431,6 +2628,7 @@ export default function POSBilling() {
     analyticsStartDate,
     analyticsEndDate,
     analyticsGstFilter,
+    todayKey,
   ]);
 
   // Inventory-derived data: low stock alerts
@@ -2848,6 +3046,7 @@ export default function POSBilling() {
       "Source        ",
       "Subtotal      ",
       "Discount      ",
+      "GST Amount    ",
       "Delivery Fee  ",
       "Grand Total   ",
       "Status        ",
@@ -2885,6 +3084,7 @@ export default function POSBilling() {
         o.source,
         o.subtotal,
         o.discount,
+        o.isGst ? (o.gstAmount ?? 0) : 0,
         o.deliveryFee,
         o.grandTotal,
         o.status,
@@ -2912,7 +3112,7 @@ export default function POSBilling() {
     link.setAttribute("href", url);
     link.setAttribute(
       "download",
-      `Order_History_${historyPeriod}_${new Date().toISOString().split("T")[0]}.csv`,
+      `Order_History_${historyPeriod}_${localDateStr()}.csv`,
     );
     link.style.visibility = "hidden";
     document.body.appendChild(link);
@@ -2977,7 +3177,7 @@ export default function POSBilling() {
     link.setAttribute("href", url);
     link.setAttribute(
       "download",
-      `Inventory_${new Date().toISOString().split("T")[0]}.csv`,
+      `Inventory_${localDateStr()}.csv`,
     );
     link.style.visibility = "hidden";
     document.body.appendChild(link);
@@ -3033,7 +3233,7 @@ export default function POSBilling() {
     link.setAttribute("href", url);
     link.setAttribute(
       "download",
-      `Stock_Report_${new Date().toISOString().split("T")[0]}.csv`,
+      `Stock_Report_${localDateStr()}.csv`,
     );
     link.style.visibility = "hidden";
     document.body.appendChild(link);
@@ -3934,10 +4134,16 @@ export default function POSBilling() {
                         </label>
                         <input
                           type="date"
-                          max={new Date().toISOString().split("T")[0]}
+                          max={localDateStr()}
                           className="w-full bg-[#FFFFFF]/40 border border-black/10 hover:border-black/10 focus:border-[#14243D] focus:bg-white rounded-lg px-4 py-2.5 text-[#000000] text-sm font-bold focus:outline-none transition-colors cursor-pointer shadow-sm"
-                          value={customOrderDate}
-                          onChange={(e) => setCustomOrderDate(e.target.value)}
+                          value={customOrderDate || localDateStr()}
+                          onChange={(e) =>
+                            setCustomOrderDate(
+                              e.target.value && e.target.value < localDateStr()
+                                ? e.target.value
+                                : "",
+                            )
+                          }
                         />
                       </div>
                     </div>
@@ -4422,7 +4628,7 @@ export default function POSBilling() {
                             {items
                               .filter((i) => i.name)
                               .reduce((sum, i) => sum + i.qty, 0)}{" "}
-                            items) <span className="text-[9px] font-bold text-[#9A7A24] uppercase">incl. GST</span>
+                            items){applyGST && <span className="ml-1 text-[9px] font-bold text-[#9A7A24] uppercase">excl. GST</span>}
                           </span>
                           <span className="font-bold text-[#000000]">
                             ₹
@@ -4467,7 +4673,7 @@ export default function POSBilling() {
                           {applyGST && (
                             <div className="flex justify-between items-center">
                               <span className="text-xs font-bold text-[#000000] uppercase tracking-wider">
-                                GST <span className="text-[9px] font-bold text-[#9A7A24]">(incl.)</span>
+                                GST <span className="text-[9px] font-bold text-[#9A7A24]">(added)</span>
                               </span>
                               <div className="flex items-center gap-2">
                                 <div className="flex items-center gap-1">
@@ -4675,6 +4881,12 @@ export default function POSBilling() {
                     <span>Order Total</span>
                     <span>₹{grandTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</span>
                   </div>
+                  {calculatedDiscount > 0 && (
+                    <p className="mt-1 text-[10px] font-bold text-[#B45309]">
+                      Includes a discount of ₹{calculatedDiscount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      {discountType === "percent" ? ` (${discountValue}%)` : ""}
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -4747,14 +4959,14 @@ export default function POSBilling() {
         )}
 
         {/* ── Advance Order VIEW / RECEIVE-BALANCE dialog ────────── */}
-        {selectedAdvance && advanceViewMode && (
+        {selectedAdvance && advanceViewMode === "view" && (
           <div className="fixed inset-0 z-[400] flex items-center justify-center p-3 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-5 max-h-[92vh] overflow-y-auto animate-in zoom-in-95 duration-200">
               <div className="flex justify-between items-center pb-3 border-b border-black/10">
                 <div>
                   <p className="text-[11px] font-mono font-bold text-[#14243D]">{selectedAdvance.id}</p>
                   <h3 className="text-lg font-black text-[#000000] tracking-tight">
-                    {advanceViewMode === "receive" ? "Receive Remaining Payment" : "Advance Order Details"}
+                    Advance Order Details
                   </h3>
                 </div>
                 <button onClick={closeAdvanceDialog} className="text-black hover:bg-black/5 w-7 h-7 rounded-lg flex items-center justify-center cursor-pointer">
@@ -4784,6 +4996,26 @@ export default function POSBilling() {
                     </div>
                   ))}
                 </div>
+
+                {(() => {
+                  const t = resolveAdvanceTotals(selectedAdvance);
+                  if (!(t.discountAmount > 0 || t.gstAmount > 0 || t.deliveryFee > 0)) return null;
+                  const money = (n: number) => `₹${n.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+                  return (
+                    <div className="border border-black/10 rounded-lg p-2.5 space-y-1 text-xs font-semibold text-black">
+                      <div className="flex justify-between"><span>Subtotal</span><span>{money(t.subtotal)}</span></div>
+                      {t.discountAmount > 0 && (
+                        <div className="flex justify-between"><span>Discount{selectedAdvance.discount_type === "PERCENT" && Number(selectedAdvance.discount_value) > 0 ? ` (${Number(selectedAdvance.discount_value)}%)` : ""}</span><span>-{money(t.discountAmount)}</span></div>
+                      )}
+                      {t.gstAmount > 0 && (
+                        <div className="flex justify-between"><span>GST ({t.gstPercentage}%)</span><span>{money(t.gstAmount)}</span></div>
+                      )}
+                      {t.deliveryFee > 0 && (
+                        <div className="flex justify-between"><span>Delivery</span><span>{money(t.deliveryFee)}</span></div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <div className="grid grid-cols-3 gap-2 text-center">
                   <div className="bg-[#F4F4F5] border border-black/10 rounded-lg p-2.5">
@@ -4817,19 +5049,7 @@ export default function POSBilling() {
                     <Printer className="w-4 h-4 text-[#14243D]" /> Print Receipt
                   </button>
                   <button
-                    onClick={() => shareAdvanceReceiptWhatsApp({
-                      id: selectedAdvance.id,
-                      customerName: selectedAdvance.customer_name || "Guest",
-                      customerPhone: selectedAdvance.customer_phone,
-                      total: selectedAdvance.total_amount,
-                      deposit: selectedAdvance.deposit_amount,
-                      balance: balanceRemaining(selectedAdvance),
-                      items: selectedAdvance.items.map((i) => ({
-                        name: i.snapshot_name,
-                        qty: i.quantity,
-                        price: Number(i.snapshot_price)
-                      }))
-                    })}
+                    onClick={() => shareAdvanceReceiptWhatsApp(advanceShareArgs(selectedAdvance))}
                     className="flex-1 w-full py-2.5 bg-[#25D366] hover:bg-[#22C35E] text-white rounded-lg font-bold text-[10px] uppercase tracking-wider flex items-center justify-center gap-2 transition-colors cursor-pointer"
                   >
                     <MessageCircle className="w-4 h-4" /> WhatsApp
@@ -4949,8 +5169,9 @@ export default function POSBilling() {
             </div>
 
             {/* Rows */}
+            {/* Fluid columns (minmax(0,…)) + wrapping text: everything fits, no horizontal scroll. */}
             <div className="bg-white border border-black/10 rounded-xl overflow-hidden">
-              <div className="hidden md:grid grid-cols-[1.1fr_1.3fr_1.5fr_1.5fr_0.9fr_1.1fr_1.4fr] gap-3 px-4 py-3 border-b border-black/10 text-[10px] font-black uppercase tracking-wider text-[#9A7A24] bg-[#F9FAFB]">
+              <div className="hidden md:grid md:grid-cols-[minmax(0,1.15fr)_minmax(0,1.1fr)_minmax(0,1.3fr)_minmax(0,1.4fr)_minmax(0,0.8fr)_minmax(0,1fr)_150px] gap-3 px-4 py-3 border-b border-black/10 text-[10px] font-black uppercase tracking-wider text-[#9A7A24] bg-[#F9FAFB]">
                 <span>Deposit ID</span>
                 <span>Customer</span>
                 <span>Product</span>
@@ -4989,7 +5210,8 @@ export default function POSBilling() {
                   );
                 }
                 return filtered.map((a) => {
-                  const bal = balanceRemaining(a);
+                  // A completed advance was settled by its invoice; a cancelled one owes nothing.
+                  const bal = a.status === "COMPLETED" || a.status === "CANCELLED" ? 0 : balanceRemaining(a);
                   const statusStyles: Record<AdvanceOrderStatus, string> = {
                     PENDING: "bg-[#FEF3C7] text-[#78350F] border-[#F59E0B]/30",
                     READY: "bg-[#DBEAFE] text-[#1E3A8A] border-[#2563EB]/30",
@@ -4997,18 +5219,18 @@ export default function POSBilling() {
                     CANCELLED: "bg-[#FEE2E2] text-[#991B1B] border-[#DC2626]/30",
                   };
                   return (
-                    <div key={a.id} className="grid grid-cols-1 md:grid-cols-[1.1fr_1.3fr_1.5fr_1.5fr_0.9fr_1.1fr_1.4fr] gap-3 px-4 py-3 border-b border-black/5 items-center text-xs hover:bg-[#FAFAFA]">
+                    <div key={a.id} className="grid grid-cols-1 md:grid-cols-[minmax(0,1.15fr)_minmax(0,1.1fr)_minmax(0,1.3fr)_minmax(0,1.4fr)_minmax(0,0.8fr)_minmax(0,1fr)_150px] gap-3 px-4 py-3 border-b border-black/5 items-center text-xs hover:bg-[#FAFAFA]">
                       <div>
                         <p className="font-mono font-black text-[11px] text-black">{a.id}</p>
                         <p className="text-[9px] font-bold text-[#9A7A24]">{new Date(a.created_at).toLocaleDateString()}</p>
                       </div>
                       <div>
-                        <p className="font-black text-black">{a.customer_name}</p>
+                        <p className="font-black text-black break-words">{a.customer_name}</p>
                         <p className="text-[10px] text-[#9A7A24]">{a.customer_phone}</p>
                       </div>
                       <div className="text-[11px]">
                         {a.items.slice(0, 2).map((i) => (
-                          <p key={i.id} className="font-bold text-black truncate">
+                          <p key={i.id} className="font-bold text-black break-words">
                             {i.quantity}× {i.snapshot_name}
                           </p>
                         ))}
@@ -5017,6 +5239,9 @@ export default function POSBilling() {
                         )}
                       </div>
                       <div className="text-[11px]">
+                        {Number(a.discount_amount) > 0 && (
+                          <p className="text-[#B45309] font-bold">Discount{a.discount_type === "PERCENT" && Number(a.discount_value) > 0 ? ` (${Number(a.discount_value)}%)` : ""}: -₹{Number(a.discount_amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
+                        )}
                         <p className="font-bold text-black">Total: ₹{Number(a.total_amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                         <p className="text-[#16A34A] font-bold">Paid: ₹{Number(a.deposit_amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
                         <p className="text-[#DC2626] font-bold">Balance: ₹{bal.toLocaleString(undefined, { minimumFractionDigits: 2 })}</p>
@@ -5037,21 +5262,9 @@ export default function POSBilling() {
                           </button>
                         )}
                       </div>
-                      <div className="flex items-center justify-end gap-1.5 flex-nowrap">
+                      <div className="flex items-center md:justify-end gap-1.5 flex-wrap">
                         <button onClick={() => {
-                          shareAdvanceReceiptWhatsApp({
-                            id: a.id,
-                            customerName: a.customer_name || "Guest",
-                            customerPhone: a.customer_phone,
-                            total: a.total_amount,
-                            deposit: a.deposit_amount,
-                            balance: balanceRemaining(a),
-                            items: a.items.map((i) => ({
-                              name: i.snapshot_name,
-                              qty: i.quantity,
-                              price: Number(i.snapshot_price)
-                            }))
-                          });
+                          shareAdvanceReceiptWhatsApp(advanceShareArgs(a));
                         }} title="Send on WhatsApp" className="flex items-center justify-center w-8 h-8 bg-[#10B981]/10 hover:bg-[#10B981]/20 text-[#10B981] rounded-md transition-colors cursor-pointer shrink-0">
                           <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.012c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z" />
@@ -5453,6 +5666,11 @@ export default function POSBilling() {
                               </td>
                               <td className="p-4 text-sm font-black text-[#14243D]">
                                 ₹{order.grandTotal.toLocaleString()}
+                                {order.discount > 0 && (
+                                  <span className="block text-[10px] font-bold text-[#B45309]">
+                                    Discount{order.discountType === "PERCENT" && order.discountValue ? ` (${order.discountValue}%)` : ""}: -₹{order.discount.toLocaleString()}
+                                  </span>
+                                )}
                               </td>
                               <td className="p-4 text-right">
                                 <div className="flex flex-row items-center justify-end gap-1.5">
@@ -5472,6 +5690,15 @@ export default function POSBilling() {
                                     >
                                       <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51a12.8 12.8 0 0 0-.57-.012c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413Z" />
                                     </svg>
+                                  </button>
+                                  <button
+                                    onClick={() => handleOpenPrintModal(order.id, "invoice")}
+                                    title="Print receipt"
+                                    aria-label="Print receipt"
+                                    className="flex items-center gap-1.5 h-8 px-2.5 bg-[#14243D] hover:bg-[#1c3556] text-white rounded-md text-[10px] font-bold uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
+                                  >
+                                    <Printer className="w-3.5 h-3.5" />
+                                    Print Receipt
                                   </button>
                                   <button
                                     onClick={() => handleOpenPrintModal(order.id, "invoice")}
@@ -5724,7 +5951,9 @@ export default function POSBilling() {
                       ₹{todayRevenue.toLocaleString()}
                     </div>
                     <div className="text-[9px] text-[#000000] font-semibold">
-                      Completed today
+                      Excl. GST
+                      {todayGstCollected > 0 &&
+                        ` • GST collected ₹${todayGstCollected.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                     </div>
                   </div>
 
@@ -5812,6 +6041,9 @@ export default function POSBilling() {
                                   Items
                                 </th>
                                 <th className="p-3 text-[10px] font-bold text-[#000000] uppercase tracking-wider text-right">
+                                  GST
+                                </th>
+                                <th className="p-3 text-[10px] font-bold text-[#000000] uppercase tracking-wider text-right">
                                   Grand Total
                                 </th>
                               </tr>
@@ -5845,6 +6077,11 @@ export default function POSBilling() {
                                       0,
                                     )}{" "}
                                     pcs
+                                  </td>
+                                  <td className="p-3 text-xs font-semibold text-[#000000] text-right">
+                                    {order.isGst && (order.gstAmount ?? 0) > 0
+                                      ? `₹${(order.gstAmount ?? 0).toLocaleString()}`
+                                      : "—"}
                                   </td>
                                   <td className="p-3 text-xs font-black text-[#14243D] text-right">
                                     ₹{order.grandTotal.toLocaleString()}
@@ -5992,7 +6229,7 @@ export default function POSBilling() {
                               })}
                             </div>
                             <div className="text-[9px] text-white/95 font-black mt-1 tracking-wide">
-                              GST + Non-GST − Expenses
+                              GST + Non-GST (excl. GST) − Expenses
                             </div>
                           </div>
                         );
@@ -6016,7 +6253,14 @@ export default function POSBilling() {
                           })}
                         </div>
                         <div className="text-[9px] text-[#000000] font-semibold mt-1">
-                          {gstOrdersCount} GST invoices
+                          {gstOrdersCount} GST invoices • excl. GST
+                        </div>
+                        <div className="text-[9px] text-[#4F46E5] font-bold mt-0.5">
+                          GST collected: ₹
+                          {gstCollected.toLocaleString("en-IN", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
                         </div>
                       </div>
 
@@ -6139,6 +6383,10 @@ export default function POSBilling() {
                       {analyticsGstFilter === "all"
                         ? `GST (₹${gstRevenue.toLocaleString("en-IN")}) + Non-GST (₹${nonGstRevenue.toLocaleString("en-IN")})`
                         : "POS + manual combined"}
+                      {" • excl. GST"}
+                      {gstCollected > 0 &&
+                        analyticsGstFilter !== "nongst" &&
+                        ` • GST collected ₹${gstCollected.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                     </div>
                   </div>
 
@@ -6941,7 +7189,7 @@ export default function POSBilling() {
               <div className="lg:col-span-2 bg-white border border-black/10 rounded-2xl p-5 shadow-sm h-fit">
                 <h3 className="text-sm font-black text-[#000000] uppercase tracking-wider flex items-center gap-2 mb-4">
                   <span className="w-1.5 h-6 bg-[#14243D] rounded-full" />
-                  Add Expense
+                  {editingExpenseId ? "Edit Expense" : "Add Expense"}
                 </h3>
                 <div className="space-y-3">
                   <div>
@@ -6990,15 +7238,25 @@ export default function POSBilling() {
                     </div>
                   </div>
                   <div>
-                    <label className="block text-[10px] font-bold uppercase tracking-wider text-[#000000] mb-1">
-                      Category
+                    <label className="mb-1 flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-[#000000]">
+                      <span>Category</span>
+                      <button
+                        type="button"
+                        onClick={() => setShowExpCatModal(true)}
+                        className="text-[#14243D] hover:underline normal-case tracking-normal font-extrabold cursor-pointer"
+                      >
+                        Manage Categories
+                      </button>
                     </label>
                     <select
                       value={expCategory}
                       onChange={(e) => setExpCategory(e.target.value)}
                       className="w-full bg-[#FAFAFA] border border-black/10 rounded-lg px-3 py-2 text-sm text-[#000000] focus:outline-none focus:border-[#14243D] cursor-pointer"
                     >
-                      {EXPENSE_CATEGORIES.map((c) => (
+                      {(expenseCategories.includes(expCategory) || expCategory === "__custom__"
+                        ? expenseCategories
+                        : [...expenseCategories, expCategory]
+                      ).map((c) => (
                         <option key={c} value={c}>
                           {c}
                         </option>
@@ -7053,9 +7311,23 @@ export default function POSBilling() {
                     disabled={isSavingExpense}
                     className="w-full mt-1 bg-[#14243D] hover:bg-[#27272A] disabled:opacity-60 text-white py-3 rounded-lg font-black text-[11px] uppercase tracking-[0.1em] flex items-center justify-center gap-2 transition-transform active:scale-[0.98] shadow-sm cursor-pointer"
                   >
-                    <Plus className="w-4 h-4" />
-                    {isSavingExpense ? "Saving…" : "Add Expense"}
+                    {editingExpenseId ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                    {isSavingExpense
+                      ? "Saving…"
+                      : editingExpenseId
+                        ? "Save Changes"
+                        : "Add Expense"}
                   </button>
+                  {editingExpenseId && (
+                    <button
+                      type="button"
+                      onClick={resetExpenseForm}
+                      disabled={isSavingExpense}
+                      className="w-full bg-white border border-black/10 hover:bg-black/5 text-black py-2.5 rounded-lg font-black text-[11px] uppercase tracking-[0.1em] transition-colors cursor-pointer"
+                    >
+                      Cancel Edit
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -7334,7 +7606,15 @@ export default function POSBilling() {
                               maximumFractionDigits: 2,
                             })}
                           </td>
-                          <td className="p-3 text-center">
+                          <td className="p-3 text-center whitespace-nowrap">
+                            <button
+                              onClick={() => startEditExpense(e)}
+                              title="Edit expense"
+                              aria-label="Edit expense"
+                              className="inline-flex items-center justify-center w-8 h-8 mr-1.5 bg-black/5 hover:bg-black/10 text-[#000000] rounded-md transition-colors cursor-pointer"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
                             <button
                               onClick={() => handleDeleteExpense(e.id)}
                               title="Delete expense"
@@ -8345,7 +8625,17 @@ export default function POSBilling() {
                   {(selectedOrder.gstAmount ?? 0) > 0 && (
                     <div className="flex justify-between text-sm">
                       <span className="text-[#000000] font-semibold">
-                        GST ({selectedOrder.gstPercentage ?? 0}%)
+                        GST ({selectedOrder.gstPercentage ?? 0}%
+                        {isExclusiveGstOrder({
+                          subtotal: selectedOrder.subtotal,
+                          discount: selectedOrder.discount,
+                          gstAmount: selectedOrder.gstAmount ?? 0,
+                          deliveryFee: selectedOrder.deliveryFee,
+                          grandTotal: selectedOrder.grandTotal,
+                        })
+                          ? ""
+                          : " incl."}
+                        )
                       </span>
                       <span className="text-[#000000] font-bold">
                         ₹{(selectedOrder.gstAmount ?? 0).toLocaleString()}
@@ -8393,7 +8683,7 @@ export default function POSBilling() {
 
         {/* Print Settings Modal */}
         {printSettingsModal && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[600] flex items-center justify-center p-4 animate-in fade-in duration-200">
             <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden transform scale-100 animate-in zoom-in-95 duration-200 border border-black/10">
               <div className="p-4 border-b border-black/10 flex justify-between items-center bg-[#F9FAFB]">
                 <h3 className="font-black text-sm text-black uppercase tracking-wider flex items-center gap-2">
@@ -8566,6 +8856,32 @@ export default function POSBilling() {
                     <span className="text-black/60">ID:</span>
                     <span className="text-black">{advanceReceipt.id}</span>
                   </div>
+                  {(advanceReceipt.discount || advanceReceipt.gstAmount || advanceReceipt.deliveryFee) ? (
+                    <>
+                      <div className="flex justify-between text-xs font-bold">
+                        <span className="text-black/60">Subtotal:</span>
+                        <span className="text-black">₹{(advanceReceipt.subtotal ?? 0).toFixed(2)}</span>
+                      </div>
+                      {!!advanceReceipt.discount && (
+                        <div className="flex justify-between text-xs font-bold">
+                          <span className="text-black/60">Discount:</span>
+                          <span className="text-black">-₹{advanceReceipt.discount.toFixed(2)}</span>
+                        </div>
+                      )}
+                      {!!advanceReceipt.gstAmount && (
+                        <div className="flex justify-between text-xs font-bold">
+                          <span className="text-black/60">GST{advanceReceipt.gstPercentage ? ` (${advanceReceipt.gstPercentage}%)` : ""}:</span>
+                          <span className="text-black">₹{advanceReceipt.gstAmount.toFixed(2)}</span>
+                        </div>
+                      )}
+                      {!!advanceReceipt.deliveryFee && (
+                        <div className="flex justify-between text-xs font-bold">
+                          <span className="text-black/60">Delivery:</span>
+                          <span className="text-black">₹{advanceReceipt.deliveryFee.toFixed(2)}</span>
+                        </div>
+                      )}
+                    </>
+                  ) : null}
                   <div className="flex justify-between text-xs font-bold">
                     <span className="text-black/60">Total:</span>
                     <span className="text-black">₹{advanceReceipt.total.toFixed(2)}</span>
@@ -8641,13 +8957,35 @@ export default function POSBilling() {
                 <div className="bg-[#FEF3C7] border border-[#F59E0B]/30 rounded-xl p-4 flex justify-between items-center">
                   <div>
                     <div className="text-[10px] font-bold text-[#9A7A24] uppercase tracking-wider">Outstanding Balance Due</div>
-                    <div className="text-2xl font-black text-[#B45309]">₹{(selectedAdvance.subtotal - selectedAdvance.deposit_amount).toFixed(2)}</div>
+                    <div className="text-2xl font-black text-[#B45309]">₹{(receiveBase?.balanceDue ?? balanceRemaining(selectedAdvance)).toFixed(2)}</div>
                   </div>
                   <div className="text-right text-xs font-semibold text-[#B45309]/80">
-                    <div>Total: ₹{selectedAdvance.subtotal.toFixed(2)}</div>
+                    <div>Total: ₹{(receiveBase?.grandTotal ?? Number(selectedAdvance.total_amount)).toFixed(2)}</div>
                     <div>Paid: ₹{selectedAdvance.deposit_amount.toFixed(2)}</div>
                   </div>
                 </div>
+
+                {(() => {
+                  const t = resolveAdvanceTotals(selectedAdvance);
+                  const gstNow = receiveBase?.gstAmount ?? t.gstAmount;
+                  const gstPctNow = receiveBase?.gstPercentage ?? t.gstPercentage;
+                  if (!(t.discountAmount > 0 || gstNow > 0 || t.deliveryFee > 0)) return null;
+                  const money = (n: number) => `₹${n.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+                  return (
+                    <div className="border border-black/10 rounded-lg p-2.5 space-y-1 text-xs font-semibold text-black">
+                      <div className="flex justify-between"><span>Subtotal</span><span>{money(t.subtotal)}</span></div>
+                      {t.discountAmount > 0 && (
+                        <div className="flex justify-between"><span>Discount (agreed{selectedAdvance.discount_type === "PERCENT" && Number(selectedAdvance.discount_value) > 0 ? `, ${Number(selectedAdvance.discount_value)}%` : ""})</span><span>-{money(t.discountAmount)}</span></div>
+                      )}
+                      {gstNow > 0 && (
+                        <div className="flex justify-between"><span>GST ({gstPctNow}%)</span><span>{money(gstNow)}</span></div>
+                      )}
+                      {t.deliveryFee > 0 && (
+                        <div className="flex justify-between"><span>Delivery</span><span>{money(t.deliveryFee)}</span></div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* Items Sold Card */}
                 {selectedAdvance.items && selectedAdvance.items.length > 0 && (
@@ -8669,6 +9007,35 @@ export default function POSBilling() {
                     </div>
                   </div>
                 )}
+
+                <div>
+                  <label className="block text-[10px] font-bold text-black uppercase tracking-wider mb-2">Invoice Type</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {([false, true] as const).map((gst) => (
+                      <button
+                        key={String(gst)}
+                        type="button"
+                        onClick={() => setReceiveIsGst(gst)}
+                        className={`py-2 rounded-lg text-xs font-bold tracking-wider uppercase transition-all border cursor-pointer ${receiveIsGst === gst ? "bg-[#14243D] text-white border-[#14243D]" : "bg-white text-black border-black/10"}`}
+                      >
+                        {gst ? "GST Invoice" : "NON-GST Bill"}
+                      </button>
+                    ))}
+                  </div>
+                  {receiveIsGst && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <label className="text-[10px] font-bold text-black uppercase tracking-wider">GST Rate (%)</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        value={receiveGstPct}
+                        onChange={(e) => setReceiveGstPct(Math.max(0, Number(e.target.value) || 0))}
+                        className="w-20 bg-white border border-black/10 rounded-lg px-2 py-1 text-sm font-semibold focus:outline-none focus:border-[#14243D]"
+                      />
+                    </div>
+                  )}
+                </div>
 
                 <div className="grid grid-cols-2 gap-4">
                   <div>
@@ -8692,6 +9059,13 @@ export default function POSBilling() {
                       className="w-full bg-white border border-black/10 rounded-xl px-3 py-2 text-sm font-semibold focus:outline-none focus:border-[#14243D]"
                     />
                   </div>
+                </div>
+
+                <div className="flex justify-between items-center bg-[#F0FDF4] border border-[#16A34A]/30 rounded-xl px-4 py-3">
+                  <span className="text-[10px] font-bold text-[#166534] uppercase tracking-wider">
+                    {receiveBalanceDiscountAmount > 0 ? "Payable now (after extra discount)" : "Payable now"}
+                  </span>
+                  <span className="text-lg font-black text-[#166534]">₹{receiveBalanceFinalAmount.toFixed(2)}</span>
                 </div>
 
                 <div>
@@ -8728,6 +9102,64 @@ export default function POSBilling() {
                   {isFinalizing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
                   {isFinalizing ? "Processing..." : "Receive Balance & Complete"}
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Expense Categories Modal */}
+        {showExpCatModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden border border-black/10">
+              <div className="p-4 border-b border-black/10 flex justify-between items-center bg-[#F9FAFB]">
+                <h3 className="font-black text-sm text-black uppercase tracking-wider">Manage Expense Categories</h3>
+                <button onClick={() => setShowExpCatModal(false)} className="text-black/40 hover:text-black cursor-pointer">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-4 space-y-3">
+                <form
+                  className="flex gap-2"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const added = addExpenseCategory(newExpCatName);
+                    if (added) {
+                      setExpCategory(added);
+                      setNewExpCatName("");
+                    }
+                  }}
+                >
+                  <input
+                    type="text"
+                    value={newExpCatName}
+                    onChange={(e) => setNewExpCatName(e.target.value)}
+                    placeholder="New category name"
+                    className="flex-1 bg-[#FAFAFA] border border-black/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-[#14243D]"
+                  />
+                  <button
+                    type="submit"
+                    className="px-4 bg-[#14243D] text-white rounded-lg text-[11px] font-black uppercase tracking-wider cursor-pointer"
+                  >
+                    Add
+                  </button>
+                </form>
+                <ul className="max-h-72 overflow-y-auto divide-y divide-black/5 border border-black/10 rounded-lg">
+                  {expenseCategories.map((c) => (
+                    <li key={c} className="flex items-center justify-between px-3 py-2 text-sm font-semibold text-black">
+                      <span>{c}</span>
+                      <button
+                        onClick={() => removeExpenseCategory(c)}
+                        title="Remove category"
+                        className="text-[#B91C1C] hover:bg-[#B91C1C]/10 rounded-md p-1 cursor-pointer"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[10px] font-semibold text-black/50">
+                  Saved on this device. Removing a category does not change expenses already recorded under it.
+                </p>
               </div>
             </div>
           </div>

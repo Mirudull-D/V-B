@@ -18,6 +18,7 @@ import {
   AdvanceOrderWithRelations,
   Service,
 } from './types';
+import { computeAdvanceFinalization, resolveAdvanceTotals, roundMoney } from './gst';
 
 // Utility to generate a unique ID
 const uid = () => {
@@ -52,6 +53,216 @@ function enrichProduct(
     total_stock: batchStock,
     active_selling_price,
   };
+}
+
+async function upsertCustomer(name: string, phone: string, address?: string | null): Promise<Customer> {
+  const id = uid();
+  const rows = await sql`
+    INSERT INTO customers (id, name, phone, address)
+    VALUES (${id}, ${name}, ${phone}, ${address || null})
+    ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address
+    RETURNING *
+  `;
+  return rows[0] as Customer;
+}
+
+// A batch can never go below zero stock (see migrate_stock_guard.mjs). When two
+// sales race for the last units, the loser's transaction is rolled back by that
+// constraint; we then rebuild its statements from the fresh stock and retry, so
+// it simply takes what is left (any remainder is sold off-batch as before).
+const STOCK_CONSTRAINT = 'product_batches_stock_nonneg';
+const MAX_STOCK_RETRIES = 3;
+
+function isStockViolation(e: unknown): boolean {
+  const err = e as { code?: string; constraint?: string; message?: string };
+  return (
+    err?.code === '23514' &&
+    (err.constraint === STOCK_CONSTRAINT || String(err.message).includes(STOCK_CONSTRAINT))
+  );
+}
+
+async function runWithStockRetry(build: () => Promise<ReturnType<typeof sql>[]>) {
+  for (let attempt = 1; ; attempt++) {
+    const statements = await build();
+    try {
+      await sql.transaction(statements);
+      return;
+    } catch (e) {
+      if (isStockViolation(e) && attempt < MAX_STOCK_RETRIES) continue;
+      throw e;
+    }
+  }
+}
+
+type SubmitOrderPayload = {
+  orderId: string;
+  customerName: string;
+  customerPhone: string;
+  customerAddress?: string | null;
+  source: 'ONLINE' | 'OFFLINE';
+  isGst: boolean;
+  billDate: string;
+  items: CartItem[];
+  discountType: 'PERCENT' | 'FIXED';
+  discountValue: number;
+  discountAmount: number;
+  gstPercentage: number;
+  gstAmount: number;
+  deliveryFee: number;
+  grandTotal: number;
+  cashReceived: number;
+  splitCash?: number;
+  splitGpay?: number;
+  paymentMode: PaymentMode;
+};
+
+// Builds every write needed to record a sale — the order row, its items, the
+// FIFO stock deductions and the OUT stock movements — as un-awaited queries.
+// Callers run them through sql.transaction() so an order is saved completely or
+// not at all (and finalizeAdvanceOrder can add its own statements to the same
+// transaction). Only the customer upsert and the batch read happen up front.
+async function buildOrderStatements(payload: SubmitOrderPayload) {
+  const productIds = Array.from(
+    new Set(
+      payload.items
+        .filter((i) => i.product_id)
+        .map((i) => i.product_id as string)
+    )
+  );
+
+  // Concurrently upsert customer and fetch batches for all products in 1 roundtrip
+  const [customer, allBatches] = await Promise.all([
+    upsertCustomer(payload.customerName, payload.customerPhone, payload.customerAddress),
+    productIds.length > 0
+      ? sql`
+          SELECT * FROM product_batches
+          WHERE product_id = ANY(${productIds}) AND stock_quantity > 0
+          ORDER BY arrived_at ASC
+        `
+      : Promise.resolve([]),
+  ]);
+
+  // FIFO Stock Deduction and split items in memory
+  const batchList = [...(allBatches as ProductBatch[])];
+  const finalOrderItems: Omit<OrderItemRow, 'id'>[] = [];
+  const batchUpdates: { id: string; deduction: number }[] = [];
+  // OUT stock movements to log for the stock report (one per batch consumed).
+  const outMovements: {
+    product_id: string;
+    batch_id: string;
+    quantity: number;
+    unit_cost: number;
+    snapshot_name: string;
+  }[] = [];
+
+  for (const item of payload.items) {
+    if (!item.product_id) {
+      finalOrderItems.push({
+        order_id: payload.orderId,
+        product_id: null,
+        batch_id: null,
+        snapshot_name: item.name,
+        snapshot_price: item.price,
+        quantity: item.qty,
+      });
+      continue;
+    }
+
+    let remaining = item.qty;
+    const matchingBatches = batchList.filter(
+      (b) => b.product_id === item.product_id && b.stock_quantity > 0
+    );
+
+    for (const batch of matchingBatches) {
+      if (remaining <= 0) break;
+      const take = Math.min(remaining, batch.stock_quantity);
+      batch.stock_quantity -= take;
+      batchUpdates.push({ id: batch.id, deduction: take });
+      outMovements.push({
+        product_id: item.product_id,
+        batch_id: batch.id,
+        quantity: take,
+        unit_cost: Number(batch.cost_price) || 0,
+        snapshot_name: item.name,
+      });
+
+      finalOrderItems.push({
+        order_id: payload.orderId,
+        product_id: item.product_id,
+        batch_id: batch.id,
+        snapshot_name: item.name,
+        snapshot_price: Number(batch.selling_price),
+        quantity: take,
+      });
+
+      remaining -= take;
+    }
+
+    if (remaining > 0) {
+      finalOrderItems.push({
+        order_id: payload.orderId,
+        product_id: item.product_id,
+        batch_id: null,
+        snapshot_name: item.name,
+        snapshot_price: item.price,
+        quantity: remaining,
+      });
+    }
+  }
+
+  // Subtotal is GST-exclusive (sum of line prices × qty).
+  // grand_total = subtotal - discount + gst_amount + delivery  (GST is added on top).
+  // The money columns are plain NUMERIC (no fixed scale), so round to paise
+  // here or float noise like 1030.8000000000002 would be stored as-is.
+  const discountAmount = roundMoney(payload.discountAmount);
+  const gstAmount = roundMoney(payload.gstAmount);
+  const deliveryFee = roundMoney(payload.deliveryFee);
+  const grandTotal = roundMoney(payload.grandTotal);
+  const subtotalExclusive = roundMoney(grandTotal + discountAmount - gstAmount - deliveryFee);
+
+  // The customer's name is frozen onto the order so renaming the customer later
+  // does not rewrite old bills.
+  return [
+    sql`
+      INSERT INTO orders (
+        id, customer_id, customer_name_snapshot, source, status, is_gst, subtotal, discount_type, discount_value,
+        discount_amount, gst_percentage, gst_amount, delivery_fee, grand_total,
+        cash_received, split_cash, split_gpay, payment_mode, bill_date, created_at
+      ) VALUES (
+        ${payload.orderId}, ${customer.id}, ${payload.customerName}, ${payload.source}, 'COMPLETED', ${payload.isGst},
+        ${subtotalExclusive},
+        ${payload.discountType}, ${payload.discountValue}, ${discountAmount},
+        ${payload.gstPercentage}, ${gstAmount}, ${deliveryFee},
+        ${grandTotal}, ${roundMoney(payload.cashReceived)},
+        ${payload.splitCash ?? 0}, ${payload.splitGpay ?? 0},
+        ${payload.paymentMode}, ${payload.billDate}, now()
+      )
+    `,
+    ...finalOrderItems.map((oi) =>
+      sql`
+        INSERT INTO order_items (
+          id, order_id, product_id, batch_id, snapshot_name, snapshot_price, quantity
+        ) VALUES (
+          ${uid()}, ${oi.order_id}, ${oi.product_id}, ${oi.batch_id},
+          ${oi.snapshot_name}, ${oi.snapshot_price}, ${oi.quantity}
+        )
+      `
+    ),
+    ...batchUpdates.map((u) =>
+      sql`UPDATE product_batches SET stock_quantity = stock_quantity - ${u.deduction} WHERE id = ${u.id}`
+    ),
+    ...outMovements.map((m) =>
+      sql`
+        INSERT INTO stock_movements (
+          id, product_id, batch_id, order_id, movement_type, quantity,
+          unit_cost, snapshot_name, supplier_name, reason, moved_at
+        ) VALUES (
+          ${uid()}, ${m.product_id}, ${m.batch_id}, ${payload.orderId}, 'OUT', ${m.quantity},
+          ${m.unit_cost}, ${m.snapshot_name}, NULL, ${'Sale ' + payload.orderId}, ${payload.billDate}
+        )
+      `
+    ),
+  ];
 }
 
 export const dbStore = {
@@ -233,16 +444,7 @@ export const dbStore = {
   },
 
   // CUSTOMERS
-  async upsertCustomer(name: string, phone: string, address?: string | null): Promise<Customer> {
-    const id = uid();
-    const rows = await sql`
-      INSERT INTO customers (id, name, phone, address)
-      VALUES (${id}, ${name}, ${phone}, ${address || null})
-      ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, address = EXCLUDED.address
-      RETURNING *
-    `;
-    return rows[0] as Customer;
-  },
+  upsertCustomer,
 
   // ORDERS
   async orderIdExists(id: string): Promise<boolean> {
@@ -251,22 +453,24 @@ export const dbStore = {
   },
 
   async listOrdersWithRelations(): Promise<OrderWithRelations[]> {
-    const orders = await sql`
-      SELECT o.*, c.name as customer_name, c.phone as customer_phone, c.address as customer_address
-      FROM orders o
-      JOIN customers c ON c.id = o.customer_id
-      ORDER BY o.created_at DESC
-    `;
+    // Name comes from the snapshot taken at billing time; COALESCE covers rows
+    // that predate the snapshot column.
+    const [orders, items] = await Promise.all([
+      sql`
+        SELECT o.*, COALESCE(o.customer_name_snapshot, c.name) as customer_name,
+               c.phone as customer_phone, c.address as customer_address
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        ORDER BY o.created_at DESC
+      `,
+      sql`
+        SELECT oi.*, b.hsn_code
+        FROM order_items oi
+        LEFT JOIN product_batches b ON b.id = oi.batch_id
+      `,
+    ]);
 
     if (orders.length === 0) return [];
-
-    const orderIds = orders.map((o: any) => o.id);
-    const items = await sql`
-      SELECT oi.*, b.hsn_code
-      FROM order_items oi
-      LEFT JOIN product_batches b ON b.id = oi.batch_id
-      WHERE oi.order_id = ANY(${orderIds})
-    `;
 
     return orders.map((o: any) => ({
       ...o,
@@ -275,20 +479,22 @@ export const dbStore = {
   },
 
   async getOrderWithRelations(id: string): Promise<OrderWithRelations | null> {
-    const orders = await sql`
-      SELECT o.*, c.name as customer_name, c.phone as customer_phone, c.address as customer_address
-      FROM orders o
-      JOIN customers c ON c.id = o.customer_id
-      WHERE o.id = ${id}
-    `;
+    const [orders, items] = await Promise.all([
+      sql`
+        SELECT o.*, COALESCE(o.customer_name_snapshot, c.name) as customer_name,
+               c.phone as customer_phone, c.address as customer_address
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = ${id}
+      `,
+      sql`
+        SELECT oi.*, b.hsn_code
+        FROM order_items oi
+        LEFT JOIN product_batches b ON b.id = oi.batch_id
+        WHERE oi.order_id = ${id}
+      `,
+    ]);
     if (orders.length === 0) return null;
-
-    const items = await sql`
-      SELECT oi.*, b.hsn_code
-      FROM order_items oi
-      LEFT JOIN product_batches b ON b.id = oi.batch_id
-      WHERE oi.order_id = ${id}
-    `;
 
     return {
       ...(orders[0] as any),
@@ -297,9 +503,43 @@ export const dbStore = {
   },
 
   async deleteOrder(id: string): Promise<void> {
-    // The order's OUT stock movements are kept as an audit trail; their order_id
-    // is set to NULL automatically via ON DELETE SET NULL.
-    await sql`DELETE FROM orders WHERE id = ${id}`;
+    // One transaction: lock the order, put its stock back, reopen the advance it
+    // came from (if any), then delete it. The first statement takes the row lock,
+    // so a concurrent second delete waits, then finds nothing and restocks nothing.
+    // The order's OUT stock movements are kept as an audit trail (their order_id
+    // becomes NULL via ON DELETE SET NULL); the restock is logged as an ADJUST.
+    await sql.transaction([
+      sql`SELECT id FROM orders WHERE id = ${id} FOR UPDATE`,
+      sql`
+        INSERT INTO stock_movements (
+          id, product_id, batch_id, order_id, movement_type, quantity,
+          unit_cost, snapshot_name, supplier_name, reason, moved_at
+        )
+        SELECT gen_random_uuid()::text, oi.product_id, oi.batch_id, NULL, 'ADJUST', SUM(oi.quantity),
+               b.cost_price, MAX(oi.snapshot_name), NULL, ${'Order ' + id + ' deleted - stock restored'}, CURRENT_DATE
+        FROM order_items oi
+        JOIN product_batches b ON b.id = oi.batch_id
+        WHERE oi.order_id = ${id} AND oi.product_id IS NOT NULL
+        GROUP BY oi.product_id, oi.batch_id, b.cost_price
+      `,
+      sql`
+        UPDATE product_batches b
+        SET stock_quantity = b.stock_quantity + s.q
+        FROM (
+          SELECT batch_id, SUM(quantity) AS q
+          FROM order_items
+          WHERE order_id = ${id} AND batch_id IS NOT NULL
+          GROUP BY batch_id
+        ) s
+        WHERE b.id = s.batch_id
+      `,
+      sql`
+        UPDATE advance_orders
+        SET status = 'PENDING', finalized_order_id = NULL, finalized_at = NULL
+        WHERE finalized_order_id = ${id}
+      `,
+      sql`DELETE FROM orders WHERE id = ${id}`,
+    ]);
   },
 
   // EXPENSES
@@ -353,190 +593,25 @@ export const dbStore = {
   },
 
   // FIFO DEDUCTION & ORDER SUBMISSION
-  async submitOrder(payload: {
-    orderId: string;
-    customerName: string;
-    customerPhone: string;
-    customerAddress?: string | null;
-    source: 'ONLINE' | 'OFFLINE';
-    isGst: boolean;
-    billDate: string;
-    items: CartItem[];
-    discountType: 'PERCENT' | 'FIXED';
-    discountValue: number;
-    discountAmount: number;
-    gstPercentage: number;
-    gstAmount: number;
-    deliveryFee: number;
-    grandTotal: number;
-    cashReceived: number;
-    splitCash?: number;
-    splitGpay?: number;
-    paymentMode: PaymentMode;
-  }): Promise<{ orderId: string }> {
-    // Neon HTTP doesn't natively support full interactive transactions in the simple API,
-    // but we can execute them sequentially or use multiple statements.
-    // For simplicity, we'll do sequential awaits which is fine for this scale,
-    // or batch them if possible. Let's do sequential for clarity.
-
-    const productIds = Array.from(
-      new Set(
-        payload.items
-          .filter((i) => i.product_id)
-          .map((i) => i.product_id as string)
-      )
-    );
-
-    // Concurrently upsert customer and fetch batches for all products in 1 roundtrip
-    const [customer, allBatches] = await Promise.all([
-      this.upsertCustomer(payload.customerName, payload.customerPhone, payload.customerAddress),
-      productIds.length > 0
-        ? sql`
-            SELECT * FROM product_batches
-            WHERE product_id = ANY(${productIds}) AND stock_quantity > 0
-            ORDER BY arrived_at ASC
-          `
-        : Promise.resolve([]),
-    ]);
-
-    // FIFO Stock Deduction and split items in memory
-    const batchList = [...(allBatches as ProductBatch[])];
-    const finalOrderItems: Omit<OrderItemRow, 'id'>[] = [];
-    const batchUpdates: { id: string; deduction: number }[] = [];
-    // OUT stock movements to log for the stock report (one per batch consumed).
-    const outMovements: {
-      product_id: string;
-      batch_id: string;
-      quantity: number;
-      unit_cost: number;
-      snapshot_name: string;
-    }[] = [];
-
-    for (const item of payload.items) {
-      if (!item.product_id) {
-        finalOrderItems.push({
-          order_id: payload.orderId,
-          product_id: null,
-          batch_id: null,
-          snapshot_name: item.name,
-          snapshot_price: item.price,
-          quantity: item.qty,
-        });
-        continue;
-      }
-
-      let remaining = item.qty;
-      const matchingBatches = batchList.filter(
-        (b) => b.product_id === item.product_id && b.stock_quantity > 0
-      );
-
-      for (const batch of matchingBatches) {
-        if (remaining <= 0) break;
-        const take = Math.min(remaining, batch.stock_quantity);
-        batch.stock_quantity -= take;
-        batchUpdates.push({ id: batch.id, deduction: take });
-        outMovements.push({
-          product_id: item.product_id,
-          batch_id: batch.id,
-          quantity: take,
-          unit_cost: Number(batch.cost_price) || 0,
-          snapshot_name: item.name,
-        });
-
-        finalOrderItems.push({
-          order_id: payload.orderId,
-          product_id: item.product_id,
-          batch_id: batch.id,
-          snapshot_name: item.name,
-          snapshot_price: Number(batch.selling_price),
-          quantity: take,
-        });
-
-        remaining -= take;
-      }
-
-      if (remaining > 0) {
-        finalOrderItems.push({
-          order_id: payload.orderId,
-          product_id: item.product_id,
-          batch_id: null,
-          snapshot_name: item.name,
-          snapshot_price: item.price,
-          quantity: remaining,
-        });
-      }
-    }
-
-    // Subtotal is GST-inclusive (sum of line prices × qty).
-    // grand_total = subtotal - discount + delivery  (GST is embedded in subtotal).
-    const subtotalInclusive = payload.grandTotal + payload.discountAmount - payload.deliveryFee;
-
-    // Insert order & execute all batch stock deductions concurrently
-    await Promise.all([
-      sql`
-        INSERT INTO orders (
-          id, customer_id, source, status, is_gst, subtotal, discount_type, discount_value,
-          discount_amount, gst_percentage, gst_amount, delivery_fee, grand_total,
-          cash_received, split_cash, split_gpay, payment_mode, bill_date, created_at
-        ) VALUES (
-          ${payload.orderId}, ${customer.id}, ${payload.source}, 'COMPLETED', ${payload.isGst},
-          ${subtotalInclusive},
-          ${payload.discountType}, ${payload.discountValue}, ${payload.discountAmount},
-          ${payload.gstPercentage}, ${payload.gstAmount}, ${payload.deliveryFee},
-          ${payload.grandTotal}, ${payload.cashReceived},
-          ${payload.splitCash ?? 0}, ${payload.splitGpay ?? 0},
-          ${payload.paymentMode}, ${payload.billDate}, now()
-        )
-      `,
-      ...batchUpdates.map((u) =>
-        sql`UPDATE product_batches SET stock_quantity = stock_quantity - ${u.deduction} WHERE id = ${u.id}`
-      ),
-    ]);
-
-    // Insert order items and log OUT stock movements concurrently.
-    // Both reference the order row, which the previous await has already inserted.
-    await Promise.all([
-      ...finalOrderItems.map((oi) =>
-        sql`
-          INSERT INTO order_items (
-            id, order_id, product_id, batch_id, snapshot_name, snapshot_price, quantity
-          ) VALUES (
-            ${uid()}, ${oi.order_id}, ${oi.product_id}, ${oi.batch_id},
-            ${oi.snapshot_name}, ${oi.snapshot_price}, ${oi.quantity}
-          )
-        `
-      ),
-      ...outMovements.map((m) =>
-        sql`
-          INSERT INTO stock_movements (
-            id, product_id, batch_id, order_id, movement_type, quantity,
-            unit_cost, snapshot_name, supplier_name, reason, moved_at
-          ) VALUES (
-            ${uid()}, ${m.product_id}, ${m.batch_id}, ${payload.orderId}, 'OUT', ${m.quantity},
-            ${m.unit_cost}, ${m.snapshot_name}, NULL, ${'Sale ' + payload.orderId}, ${payload.billDate}
-          )
-        `
-      ),
-    ]);
-
+  async submitOrder(payload: SubmitOrderPayload): Promise<{ orderId: string }> {
+    await runWithStockRetry(() => buildOrderStatements(payload));
     return { orderId: payload.orderId };
   },
 
   // ADVANCE ORDERS — partial-payment holds. Stock is NOT deducted here; that
   // happens only when the balance is collected and finalizeAdvanceOrder runs.
   async listAdvanceOrders(): Promise<AdvanceOrderWithRelations[]> {
-    const rows = await sql`
-      SELECT a.*, c.name AS customer_name, c.phone AS customer_phone, c.address AS customer_address
-      FROM advance_orders a
-      JOIN customers c ON c.id = a.customer_id
-      ORDER BY a.created_at DESC
-    `;
+    const [rows, items] = await Promise.all([
+      sql`
+        SELECT a.*, COALESCE(a.customer_name_snapshot, c.name) AS customer_name,
+               c.phone AS customer_phone, c.address AS customer_address
+        FROM advance_orders a
+        JOIN customers c ON c.id = a.customer_id
+        ORDER BY a.created_at DESC
+      `,
+      sql`SELECT * FROM advance_order_items`,
+    ]);
     if (rows.length === 0) return [];
-
-    const ids = rows.map((r: any) => r.id);
-    const items = await sql`
-      SELECT * FROM advance_order_items WHERE advance_order_id = ANY(${ids})
-    `;
 
     return rows.map((r: any) => ({
       ...r,
@@ -545,14 +620,17 @@ export const dbStore = {
   },
 
   async getAdvanceOrder(id: string): Promise<AdvanceOrderWithRelations | null> {
-    const rows = await sql`
-      SELECT a.*, c.name AS customer_name, c.phone AS customer_phone, c.address AS customer_address
-      FROM advance_orders a
-      JOIN customers c ON c.id = a.customer_id
-      WHERE a.id = ${id}
-    `;
+    const [rows, items] = await Promise.all([
+      sql`
+        SELECT a.*, COALESCE(a.customer_name_snapshot, c.name) AS customer_name,
+               c.phone AS customer_phone, c.address AS customer_address
+        FROM advance_orders a
+        JOIN customers c ON c.id = a.customer_id
+        WHERE a.id = ${id}
+      `,
+      sql`SELECT * FROM advance_order_items WHERE advance_order_id = ${id}`,
+    ]);
     if (rows.length === 0) return null;
-    const items = await sql`SELECT * FROM advance_order_items WHERE advance_order_id = ${id}`;
     return { ...(rows[0] as any), items: items as AdvanceOrderItemRow[] } as AdvanceOrderWithRelations;
   },
 
@@ -567,6 +645,13 @@ export const dbStore = {
     customerPhone: string;
     customerAddress?: string | null;
     subtotal: number;
+    discountType: 'PERCENT' | 'FIXED';
+    discountValue: number;
+    discountAmount: number;
+    isGst: boolean;
+    gstPercentage: number;
+    gstAmount: number;
+    deliveryFee: number;
     totalAmount: number;
     depositAmount: number;
     depositPaymentMode: PaymentMode;
@@ -580,25 +665,32 @@ export const dbStore = {
       quantity: number;
     }[];
   }): Promise<{ advanceOrderId: string }> {
-    const customer = await this.upsertCustomer(
+    const customer = await upsertCustomer(
       payload.customerName,
       payload.customerPhone,
       payload.customerAddress,
     );
 
-    await sql`
-      INSERT INTO advance_orders (
-        id, customer_id, status, subtotal, total_amount, deposit_amount,
-        deposit_payment_mode, delivery_date, notes
-      ) VALUES (
-        ${payload.advanceOrderId}, ${customer.id}, 'PENDING',
-        ${payload.subtotal}, ${payload.totalAmount}, ${payload.depositAmount},
-        ${payload.depositPaymentMode}, ${payload.deliveryDate}, ${payload.notes}
-      )
-    `;
-
-    await Promise.all(
-      payload.items.map((it) =>
+    // The full bill breakdown is saved (not just subtotal/total) so the discount,
+    // GST and delivery survive until the balance is collected.
+    // Header + items go in one transaction so an advance is never left without
+    // its items. The customer name is snapshotted so a later rename does not
+    // change this receipt.
+    await sql.transaction([
+      sql`
+        INSERT INTO advance_orders (
+          id, customer_id, customer_name_snapshot, status, subtotal, discount_type, discount_value,
+          discount_amount, is_gst, gst_percentage, gst_amount, delivery_fee, total_amount,
+          deposit_amount, deposit_payment_mode, delivery_date, notes
+        ) VALUES (
+          ${payload.advanceOrderId}, ${customer.id}, ${payload.customerName}, 'PENDING',
+          ${roundMoney(payload.subtotal)}, ${payload.discountType}, ${payload.discountValue}, ${roundMoney(payload.discountAmount)},
+          ${payload.isGst}, ${payload.isGst ? payload.gstPercentage : 0}, ${payload.isGst ? roundMoney(payload.gstAmount) : 0},
+          ${roundMoney(payload.deliveryFee)}, ${roundMoney(payload.totalAmount)}, ${roundMoney(payload.depositAmount)},
+          ${payload.depositPaymentMode}, ${payload.deliveryDate}, ${payload.notes}
+        )
+      `,
+      ...payload.items.map((it) =>
         sql`
           INSERT INTO advance_order_items (
             id, advance_order_id, product_id, snapshot_name, snapshot_desc, snapshot_price, quantity
@@ -608,7 +700,7 @@ export const dbStore = {
           )
         `,
       ),
-    );
+    ]);
 
     return { advanceOrderId: payload.advanceOrderId };
   },
@@ -621,7 +713,7 @@ export const dbStore = {
     await sql`
       UPDATE advance_orders
       SET status = 'CANCELLED', cancelled_at = now()
-      WHERE id = ${id}
+      WHERE id = ${id} AND status IN ('PENDING', 'READY')
     `;
   },
 
@@ -630,18 +722,23 @@ export const dbStore = {
   },
 
   // Collect the remaining balance and turn the hold into a real invoice.
-  // Reuses submitOrder for FIFO stock deduction and revenue recognition.
+  // Shares buildOrderStatements with submitOrder for FIFO stock deduction and
+  // revenue recognition; the invoice and the "advance completed" update commit
+  // together in one transaction.
   async finalizeAdvanceOrder(payload: {
     advanceOrderId: string;
     invoiceId: string;
-    isGst: boolean;
-    gstPercentage: number;
-    discountType: 'PERCENT' | 'FIXED';
-    discountValue: number;
-    discountAmount: number;
-    deliveryFee: number;
+    // Optional EXTRA discount given when the balance is collected. It is entered
+    // against the balance due (GST included) and stacks on top of the discount
+    // already agreed when the advance was saved.
+    extraDiscountType: 'PERCENT' | 'FIXED';
+    extraDiscountValue: number;
     paymentMode: PaymentMode;
     billDate: string;
+    // Optional invoice-type override chosen in the receive dialog. Defaults to
+    // what was picked when the advance was booked.
+    isGst?: boolean;
+    gstPercentage?: number;
   }): Promise<{ orderId: string }> {
     const advance = await this.getAdvanceOrder(payload.advanceOrderId);
     if (!advance) throw new Error('Advance order not found');
@@ -659,42 +756,80 @@ export const dbStore = {
       qty: it.quantity,
     }));
 
-    // Grand total math mirrors POSBilling.completeSale (GST-inclusive subtotal).
-    const rawSubtotal = cart.reduce((acc, i) => acc + i.price * i.qty, 0);
-    const netInclusive = Math.max(0, rawSubtotal - payload.discountAmount);
-    const gstAmount =
-      payload.isGst && payload.gstPercentage > 0
-        ? netInclusive - netInclusive / (1 + payload.gstPercentage / 100)
-        : 0;
-    const grandTotal = netInclusive + payload.deliveryFee;
+    // Discount, GST and delivery come from what was saved with the advance (the
+    // invoice must match the total the customer was quoted) unless the receive
+    // dialog switched the invoice type.
+    const t = resolveAdvanceTotals(advance);
+    const f = computeAdvanceFinalization({
+      subtotal: cart.reduce((acc, i) => acc + i.price * i.qty, 0),
+      baseDiscount: t.discountAmount,
+      deliveryFee: t.deliveryFee,
+      deposit: t.deposit,
+      isGst: payload.isGst ?? t.isGst,
+      gstPercentage: payload.gstPercentage ?? t.gstPercentage,
+      extraDiscountType: payload.extraDiscountType,
+      extraDiscountValue: payload.extraDiscountValue,
+    });
 
-    const { orderId } = await this.submitOrder({
+    const hasExtra = f.extraOffBalance > 0;
+
+    const orderPayload: SubmitOrderPayload = {
       orderId: payload.invoiceId,
       customerName: advance.customer_name,
       customerPhone: advance.customer_phone,
       customerAddress: advance.customer_address,
       source: 'OFFLINE',
-      isGst: payload.isGst,
+      isGst: f.isGst,
       billDate: payload.billDate,
       items: cart,
-      discountType: payload.discountType,
-      discountValue: payload.discountValue,
-      discountAmount: payload.discountAmount,
-      gstPercentage: payload.isGst ? payload.gstPercentage : 0,
-      gstAmount,
-      deliveryFee: payload.deliveryFee,
-      grandTotal,
-      cashReceived: grandTotal,
+      // With an extra discount the two are combined into one fixed amount;
+      // otherwise keep how the original discount was entered (e.g. 10%).
+      discountType: hasExtra ? 'FIXED' : advance.discount_type,
+      discountValue: hasExtra ? f.discountAmount : Number(advance.discount_value) || 0,
+      discountAmount: f.discountAmount,
+      gstPercentage: f.gstPercentage,
+      gstAmount: f.gstAmount,
+      deliveryFee: t.deliveryFee,
+      grandTotal: f.grandTotal,
+      cashReceived: f.grandTotal,
       paymentMode: payload.paymentMode,
-    });
+    };
 
-    await sql`
-      UPDATE advance_orders
-      SET status = 'COMPLETED', finalized_order_id = ${orderId}, finalized_at = now()
-      WHERE id = ${payload.advanceOrderId}
-    `;
+    // The status read above is not enough to stop two clicks / two tabs from
+    // both finalizing. So the transaction first "claims" the advance (the UPDATE
+    // takes its row lock; a concurrent finalize waits here), then a guard aborts
+    // the whole transaction if the advance is no longer open. The invoice, stock
+    // deduction and "completed" flag therefore commit together, exactly once.
+    try {
+      await runWithStockRetry(async () => [
+        sql`
+          UPDATE advance_orders SET status = status
+          WHERE id = ${payload.advanceOrderId} AND status IN ('PENDING', 'READY')
+        `,
+        sql`
+          SELECT 1 / (c.n - c.n)
+          FROM (
+            SELECT count(*) AS n FROM advance_orders
+            WHERE id = ${payload.advanceOrderId} AND status IN ('PENDING', 'READY')
+          ) c
+          WHERE c.n = 0
+        `,
+        ...(await buildOrderStatements(orderPayload)),
+        sql`
+          UPDATE advance_orders
+          SET status = 'COMPLETED', finalized_order_id = ${payload.invoiceId}, finalized_at = now()
+          WHERE id = ${payload.advanceOrderId}
+        `,
+      ]);
+    } catch (e) {
+      // The guard's deliberate division-by-zero means someone else got there first.
+      if ((e as { code?: string })?.code === '22012') {
+        throw new Error('Advance order already finalized or cancelled');
+      }
+      throw e;
+    }
 
-    return { orderId };
+    return { orderId: payload.invoiceId };
   },
 
   // SERVICES
